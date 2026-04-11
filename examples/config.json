@@ -1,0 +1,50 @@
+{
+  "listen": {
+    "bind": "0.0.0.0:2525",
+    "banner": "sendmail-sec",
+    "auth": {
+      "username": "inbound-relay",
+      "password": "change-me"
+    },
+    "allowed_networks": [
+      "127.0.0.0/8",
+      "::1/128",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ],
+    "message_size_limit_bytes": 26214400
+  },
+  "remote_smtp": {
+    "host": "smtp.example.com",
+    "port": 587,
+    "tls_mode": "starttls",
+    "hello_name": "relay.local",
+    "auth": {
+      "mechanism": "plain",
+      "username": "relay-user",
+      "password": "relay-password"
+    },
+    "connect_timeout_secs": 15,
+    "command_timeout_secs": 30
+  },
+  "tls": {
+    "extra_root_certificates": []
+  },
+  "openpgp": {
+    "local_key_files": [
+      "/config/keys/public-keys.asc"
+    ],
+    "local_key_directories": [
+      "/config/keys"
+    ],
+    "enable_wkd": true,
+    "enable_keys_openpgp_org": true,
+    "key_cache_ttl_secs": 3600,
+    "http_timeout_secs": 10,
+    "encryption_mode": "pgp_mime_body"
+  },
+  "logging": {
+    "filter": "info"
+  }
+}

@@ -55,6 +55,10 @@ RUN RUST_TARGET="$(cat /tmp/rust-target)" && \
 
 FROM --platform=$TARGETPLATFORM alpine:${ALPINE_VERSION}
 
+ARG OCI_SOURCE=""
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}"
+
 WORKDIR /app
 
 RUN addgroup -S app && adduser -S -G app app

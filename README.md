@@ -117,6 +117,14 @@ docker run --rm \
   --config /config/sendmail-sec.yaml
 ```
 
+Run the Docker integration test:
+
+```bash
+scripts/docker-integration-test.sh
+```
+
+The integration test builds a temporary image, generates temporary OpenPGP and TLS material, copies test files into containers with `docker cp`, verifies encrypted SMTP relay through a TLS fixture, and removes the containers, network, image tag, and temporary files before exiting.
+
 ## Notes
 
 - The process does not require write access beyond optional `/tmp`.

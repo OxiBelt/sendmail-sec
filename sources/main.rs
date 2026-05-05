@@ -15,6 +15,8 @@ use crate::{app::App, cli::Cli, config::AppConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+  install_crypto_provider()?;
+
   let cli: Cli = Cli::parse();
   let config: AppConfig =
     AppConfig::load(&cli.config).with_context(|| format!("loading {}", cli.config.display()))?;
@@ -27,6 +29,12 @@ async fn main() -> anyhow::Result<()> {
   }
 
   App::from_config(config).await?.run().await
+}
+
+fn install_crypto_provider() -> anyhow::Result<()> {
+  rustls::crypto::ring::default_provider()
+    .install_default()
+    .map_err(|_| anyhow::anyhow!("failed to install Rustls ring crypto provider"))
 }
 
 fn init_tracing(filter: &str) -> anyhow::Result<()> {

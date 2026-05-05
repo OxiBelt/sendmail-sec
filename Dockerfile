@@ -11,10 +11,18 @@ ARG TARGETARCH
 
 RUN apk add --no-cache build-base cmake musl-dev perl pkgconfig
 
+# The Cargo config uses canonical musl linker names. In this builder each stage
+# runs on TARGETPLATFORM, so Alpine's native GCC is already the right musl linker.
 RUN case "${TARGETARCH}" in \
-      amd64) echo "x86_64-unknown-linux-musl" > /tmp/rust-target ;; \
-      arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust-target ;; \
-      riscv64) echo "riscv64gc-unknown-linux-musl" > /tmp/rust-target ;; \
+      amd64) \
+        echo "x86_64-unknown-linux-musl" > /tmp/rust-target; \
+        ln -sf /usr/bin/gcc /usr/local/bin/x86_64-linux-musl-gcc ;; \
+      arm64) \
+        echo "aarch64-unknown-linux-musl" > /tmp/rust-target; \
+        ln -sf /usr/bin/gcc /usr/local/bin/aarch64-linux-musl-gcc ;; \
+      riscv64) \
+        echo "riscv64gc-unknown-linux-musl" > /tmp/rust-target; \
+        ln -sf /usr/bin/gcc /usr/local/bin/riscv64-linux-musl-gcc ;; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac
 

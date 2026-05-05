@@ -1,0 +1,98 @@
+name: Check
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit-tests:
+    name: Unit tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up cargo
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+
+      - name: Cargo fmt
+        run: cargo fmt --all --check
+
+      - name: Cargo clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --locked
+
+  docker-image:
+    name: Docker image and integration (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+            qemu_platforms: ""
+            rust_builder_image: rust:1.94-alpine
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            qemu_platforms: ""
+            rust_builder_image: rust:1.94-alpine
+          - arch: riscv64
+            platform: linux/riscv64
+            runner: ubuntu-latest
+            qemu_platforms: riscv64
+            rust_builder_image: rust:1.94-trixie
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up QEMU
+        if: matrix.qemu_platforms != ''
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        with:
+          platforms: ${{ matrix.qemu_platforms }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build Docker image
+        env:
+          IMAGE_TAG: sendmail-sec:ci-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PLATFORM: ${{ matrix.platform }}
+          RUST_BUILDER_IMAGE: ${{ matrix.rust_builder_image }}
+        run: |
+          docker buildx build \
+            --platform "${PLATFORM}" \
+            --build-arg "RUST_BUILDER_IMAGE=${RUST_BUILDER_IMAGE}" \
+            --tag "${IMAGE_TAG}" \
+            --load \
+            .
+
+      - name: Run Docker integration test
+        env:
+          APP_IMAGE: sendmail-sec:ci-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          APP_IMAGE_CLEANUP: "1"
+        run: scripts/docker-integration-test.sh

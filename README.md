@@ -135,7 +135,7 @@ The integration test builds a temporary image, generates temporary OpenPGP and T
 
 ## Release Automation
 
-- A semver tag such as `v1.2.3` or `v1.2.3-rc.1` triggers GitHub Actions to build release binaries for all supported GNU and musl targets.
+- A semver tag such as `2.1.2` or `1.1.0-beta.1` triggers GitHub Actions to build release binaries for all supported GNU and musl targets.
 - Those binary builds are uploaded as workflow artifacts immediately after the tag push so they exist before an immutable GitHub Release is published.
 - Docker images are built and published only when a GitHub Release is published.
 - The Docker workflow publishes a multi-arch Alpine image for `linux/amd64`, `linux/arm64`, and `linux/riscv64`.

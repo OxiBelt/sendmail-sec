@@ -100,18 +100,18 @@ impl OpenPgpService {
       return Ok(certs);
     }
 
-    if self.config.enable_wkd {
-      if let Some(certs) = self.fetch_from_wkd(&recipient).await? {
-        self.cache_success(&recipient, certs.clone()).await;
-        return Ok(certs);
-      }
+    if self.config.enable_wkd
+      && let Some(certs) = self.fetch_from_wkd(&recipient).await?
+    {
+      self.cache_success(&recipient, certs.clone()).await;
+      return Ok(certs);
     }
 
-    if self.config.enable_keys_openpgp_org {
-      if let Some(certs) = self.fetch_from_keys_openpgp_org(&recipient).await? {
-        self.cache_success(&recipient, certs.clone()).await;
-        return Ok(certs);
-      }
+    if self.config.enable_keys_openpgp_org
+      && let Some(certs) = self.fetch_from_keys_openpgp_org(&recipient).await?
+    {
+      self.cache_success(&recipient, certs.clone()).await;
+      return Ok(certs);
     }
 
     bail!("no OpenPGP public key found for recipient {recipient}");

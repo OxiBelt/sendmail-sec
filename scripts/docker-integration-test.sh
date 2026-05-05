@@ -2,6 +2,9 @@
 set -Eeuo pipefail
 
 APP_IMAGE_PREFIX="${APP_IMAGE_PREFIX:-sendmail-sec}"
+APP_IMAGE="${APP_IMAGE:-}"
+APP_IMAGE_CLEANUP="${APP_IMAGE_CLEANUP:-0}"
+DOCKER_BUILD_PLATFORM="${DOCKER_BUILD_PLATFORM:-}"
 HELPER_IMAGE="${HELPER_IMAGE:-python:3.12-alpine}"
 PGP_EMAIL="${PGP_EMAIL:-recipient@example.test}"
 INBOUND_USERNAME="${INBOUND_USERNAME:-inbound-relay}"
@@ -118,7 +121,12 @@ require_command sed
 docker info >/dev/null 2>&1 || die "Docker is not available to this shell"
 
 run_id="$(date +%Y%m%d%H%M%S)-$$-$(openssl rand -hex 4)"
-app_image="${APP_IMAGE_PREFIX}:integration-${run_id}"
+if [ -n "$APP_IMAGE" ]; then
+  app_image="$APP_IMAGE"
+else
+  app_image="${APP_IMAGE_PREFIX}:integration-${run_id}"
+  APP_IMAGE_CLEANUP=1
+fi
 network="sendmail-sec-it-${run_id}"
 smtp_container="sendmail-sec-smtp-${run_id}"
 app_container="sendmail-sec-app-${run_id}"
@@ -128,7 +136,9 @@ gnupghome="${tmpdir}/gnupg"
 config_dir="${tmpdir}/config"
 
 containers+=("$client_container" "$app_container" "$smtp_container")
-images+=("$app_image")
+if [ "$APP_IMAGE_CLEANUP" = "1" ]; then
+  images+=("$app_image")
+fi
 
 mkdir -p "$config_dir"
 chmod 755 "$config_dir"
@@ -389,8 +399,16 @@ with socket.create_connection((host, port), timeout=10) as sock:
     command(sock, "QUIT", "221")
 PY
 
-log "building application image ${app_image}"
-docker build -t "$app_image" "$repo_root"
+if [ -n "$APP_IMAGE" ]; then
+  log "using prebuilt application image ${app_image}"
+else
+  log "building application image ${app_image}"
+  if [ -n "$DOCKER_BUILD_PLATFORM" ]; then
+    docker buildx build --load --platform "$DOCKER_BUILD_PLATFORM" -t "$app_image" "$repo_root"
+  else
+    docker build -t "$app_image" "$repo_root"
+  fi
+fi
 
 log "creating isolated Docker network ${network}"
 docker network create "$network" >/dev/null

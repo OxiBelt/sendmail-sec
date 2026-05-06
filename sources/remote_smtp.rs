@@ -263,7 +263,8 @@ where
   }
 
   async fn quit(&mut self) -> anyhow::Result<()> {
-    let _ = self.command("QUIT").await?;
+    self.command_expect("QUIT", &[221]).await?;
+    self.shutdown().await?;
     Ok(())
   }
 
@@ -271,6 +272,7 @@ where
     let stuffed = dot_stuff(data);
     self.write_all(&stuffed).await?;
     self.write_all(b".\r\n").await?;
+    self.flush().await?;
     self.expect_response(&[250]).await?;
     Ok(())
   }
@@ -296,6 +298,7 @@ where
   async fn command(&mut self, line: &str) -> anyhow::Result<SmtpResponse> {
     self.write_all(line.as_bytes()).await?;
     self.write_all(b"\r\n").await?;
+    self.flush().await?;
     self.read_response().await
   }
 
@@ -376,6 +379,20 @@ where
       .context("timed out writing to remote SMTP server")?
       .context("failed to write to remote SMTP server")
   }
+
+  async fn flush(&mut self) -> anyhow::Result<()> {
+    timeout(self.timeout, self.stream.get_mut().flush())
+      .await
+      .context("timed out flushing data to remote SMTP server")?
+      .context("failed to flush data to remote SMTP server")
+  }
+
+  async fn shutdown(&mut self) -> anyhow::Result<()> {
+    timeout(self.timeout, self.stream.get_mut().shutdown())
+      .await
+      .context("timed out closing remote SMTP connection")?
+      .context("failed to close remote SMTP connection")
+  }
 }
 
 #[derive(Debug)]
@@ -392,4 +409,103 @@ impl SmtpResponse {
 
 fn server_name(host: &str) -> anyhow::Result<ServerName<'static>> {
   ServerName::try_from(host.to_string()).with_context(|| format!("invalid TLS server name {host}"))
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+  };
+
+  use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+  use super::*;
+
+  #[tokio::test]
+  async fn command_flushes_before_reading_response() {
+    let stream = FlushGateStream::new(b"250 ok\r\n");
+    let mut connection = SmtpConnection::new(stream, Duration::from_secs(1));
+
+    let response = connection.command("NOOP").await.unwrap();
+
+    assert_eq!(response.code, 250);
+    let stream = connection.into_inner();
+    assert_eq!(stream.written, b"NOOP\r\n");
+    assert!(stream.flushed);
+  }
+
+  #[tokio::test]
+  async fn quit_shuts_down_stream_after_response() {
+    let stream = FlushGateStream::new(b"221 bye\r\n");
+    let mut connection = SmtpConnection::new(stream, Duration::from_secs(1));
+
+    connection.quit().await.unwrap();
+
+    let stream = connection.into_inner();
+    assert_eq!(stream.written, b"QUIT\r\n");
+    assert!(stream.shutdown);
+  }
+
+  struct FlushGateStream {
+    response: Vec<u8>,
+    response_offset: usize,
+    written: Vec<u8>,
+    flushed: bool,
+    shutdown: bool,
+  }
+
+  impl FlushGateStream {
+    fn new(response: &[u8]) -> Self {
+      Self {
+        response: response.to_vec(),
+        response_offset: 0,
+        written: Vec::new(),
+        flushed: false,
+        shutdown: false,
+      }
+    }
+  }
+
+  impl AsyncRead for FlushGateStream {
+    fn poll_read(
+      mut self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+      if !self.flushed {
+        return Poll::Ready(Ok(()));
+      }
+
+      let remaining = &self.response[self.response_offset..];
+      let length = remaining.len().min(buf.remaining());
+      buf.put_slice(&remaining[..length]);
+      self.response_offset += length;
+      Poll::Ready(Ok(()))
+    }
+  }
+
+  impl AsyncWrite for FlushGateStream {
+    fn poll_write(
+      mut self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+      self.written.extend_from_slice(bytes);
+      Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      self.flushed = true;
+      Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      self.shutdown = true;
+      self.flushed = true;
+      Poll::Ready(Ok(()))
+    }
+  }
 }

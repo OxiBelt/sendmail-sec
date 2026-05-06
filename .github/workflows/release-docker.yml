@@ -56,10 +56,6 @@ jobs:
             echo "tags<<EOF"
             echo "$image:$tag"
             if [ "$stable" = "true" ]; then
-              echo "$image:$major.$minor"
-              if [ "$major" != "0" ]; then
-                echo "$image:$major"
-              fi
               echo "$image:latest"
             fi
             echo "EOF"

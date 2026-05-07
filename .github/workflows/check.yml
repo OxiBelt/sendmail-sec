@@ -41,7 +41,7 @@ jobs:
         run: cargo test --locked
 
   docker-image:
-    name: Docker image and integration (${{ matrix.arch }})
+    name: Docker image (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -91,8 +91,19 @@ jobs:
             --load \
             .
 
+      # The riscv64 image is executed through QEMU on GitHub's amd64 runner.
+      # Native amd64/arm64 jobs cover TLS relay behavior; riscv64 gets a
+      # container startup smoke test below.
       - name: Run Docker integration test
+        if: matrix.arch != 'riscv64'
         env:
           APP_IMAGE: sendmail-sec:ci-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           APP_IMAGE_CLEANUP: "1"
         run: scripts/docker-integration-test.sh
+
+      - name: Run Docker smoke test
+        if: matrix.arch == 'riscv64'
+        env:
+          IMAGE_TAG: sendmail-sec:ci-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PLATFORM: ${{ matrix.platform }}
+        run: docker run --rm --platform "${PLATFORM}" "${IMAGE_TAG}" --help >/dev/null

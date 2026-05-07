@@ -330,6 +330,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
                 with open(capture_path, "wb") as output:
                     output.write(data)
                 send(file, "250 message accepted")
+                # The assertion below only needs the accepted relay data. Do
+                # not make the fixture depend on client QUIT timing.
+                break
             elif upper == "QUIT":
                 send(file, "221 bye")
                 break

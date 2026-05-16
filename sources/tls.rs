@@ -4,6 +4,7 @@ use anyhow::{Context, bail};
 use reqwest::Certificate;
 use rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::config::TlsConfig;
@@ -19,7 +20,12 @@ impl OutboundTls {
     let mut root_store: RootCertStore = RootCertStore::empty();
     root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
 
-    let mut http_roots = Vec::new();
+    let mut http_roots = TLS_SERVER_ROOT_CERTS
+      .iter()
+      .map(|cert| {
+        Certificate::from_der(cert.as_ref()).context("failed to build HTTP root certificate")
+      })
+      .collect::<anyhow::Result<Vec<_>>>()?;
 
     for path in &config.extra_root_certificates {
       let pem = fs::read(path)
@@ -61,15 +67,12 @@ impl OutboundTls {
       bail!("HTTP timeout must be greater than zero");
     }
 
-    let mut builder = reqwest::Client::builder()
-      .use_rustls_tls()
+    let builder = reqwest::Client::builder()
+      .tls_backend_rustls()
+      .tls_certs_only(self.http_roots.clone())
       .https_only(true)
       .timeout(std::time::Duration::from_secs(timeout_secs))
       .user_agent(user_agent);
-
-    for cert in &self.http_roots {
-      builder = builder.add_root_certificate(cert.clone());
-    }
 
     builder
       .build()

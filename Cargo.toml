@@ -26,6 +26,6 @@ tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 urlencoding = "2.1"
-uuid = { version = "1.18", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4"] }
 webpki-root-certs = "1.0"
 webpki-roots = "1.0"

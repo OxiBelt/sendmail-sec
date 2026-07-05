@@ -1,4 +1,4 @@
-name: Release Docker Image
+name: Release Docker Images
 
 on:
   release:
@@ -6,94 +6,264 @@ on:
       - published
   push:
     tags:
-      - '*-build.*'
+      - "*.*.*-build.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Strict release tag to publish, such as 1.2.3, 1.2.3-beta.1, or 1.2.3-build.4f43abcd
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  SENDMAIL_SEC_GHCR_IMAGE: ghcr.io/digitalbelt/sendmail-sec
+  SENDMAIL_SEC_SOURCE_URL: https://github.com/digitalBelt/sendmail-sec
 
 jobs:
   validate:
+    name: Validate release metadata
     runs-on: ubuntu-latest
-    permissions: {}
-    outputs:
-      image: ${{ steps.release.outputs.image }}
-      stable: ${{ steps.release.outputs.stable }}
-      tag: ${{ steps.release.outputs.tag }}
-      tags: ${{ steps.release.outputs.tags }}
-
-    steps:
-      - name: Validate release tag
-        id: release
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          tag="$REF_NAME"
-
-          semver_regex='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
-          stable_regex='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-
-          if [[ ! "$tag" =~ $semver_regex ]]; then
-            echo "release tag must be a Docker-compatible semver tag: $tag" >&2
-            exit 1
-          fi
-
-          if [ "$EVENT_NAME" = "push" ] && [[ "$tag" != *-build.* ]]; then
-            echo "tag push publishing is only enabled for -build. tags: $tag" >&2
-            exit 1
-          fi
-
-          image="ghcr.io/${REPOSITORY,,}"
-          stable=false
-          if [[ "$tag" =~ $stable_regex ]]; then
-            stable=true
-          fi
-
-          IFS=. read -r major minor patch_and_suffix <<< "$tag"
-
-          {
-            echo "image=$image"
-            echo "stable=$stable"
-            echo "tag=$tag"
-            echo "tags<<EOF"
-            echo "$image:$tag"
-            if [ "$stable" = "true" ]; then
-              echo "$image:latest"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-  build:
-    name: Docker image (${{ matrix.arch }})
-    needs: validate
-    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write
+    outputs:
+      created: ${{ steps.release-ref.outputs.created }}
+      kind: ${{ steps.image-plan.outputs.kind }}
+      revision: ${{ steps.release-ref.outputs.revision }}
+      version: ${{ steps.image-plan.outputs.version }}
+
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          fetch-depth: 0
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.10.0 --activate
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate release ref matches checkout
+        id: release-ref
+        env:
+          SENDMAIL_SEC_RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+        run: |
+          set -euo pipefail
+
+          release_ref="${SENDMAIL_SEC_RELEASE_REF}"
+          if [[ "${release_ref}" != refs/tags/* ]]; then
+            echo "release ref must start with refs/tags/: ${release_ref}" >&2
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse "${release_ref}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "${tag_commit}" != "${head_commit}" ]]; then
+            echo "release tag ${release_ref} resolves to ${tag_commit}, but checkout is ${head_commit}" >&2
+            exit 1
+          fi
+
+          created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          {
+            echo "created=${created}"
+            echo "revision=${head_commit}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Apply release version
+        env:
+          SENDMAIL_SEC_IMAGE_PLAN_OUTPUT: ${{ runner.temp }}/sendmail-sec-release/image-plan.json
+          SENDMAIL_SEC_RELEASE_IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          SENDMAIL_SEC_RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          SENDMAIL_SEC_RELEASE_REVISION: ${{ steps.release-ref.outputs.revision }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/sendmail-sec-release"
+          pnpm run versioning:release
+
+      - name: Validate image release plan
+        id: image-plan
+        env:
+          IMAGE_PLAN: ${{ runner.temp }}/sendmail-sec-release/image-plan.json
+          SENDMAIL_SEC_IMAGE: ${{ env.SENDMAIL_SEC_GHCR_IMAGE }}
+          SENDMAIL_SEC_RELEASE_REVISION: ${{ steps.release-ref.outputs.revision }}
+          SENDMAIL_SEC_SOURCE_URL: ${{ env.SENDMAIL_SEC_SOURCE_URL }}
+        run: |
+          set -euo pipefail
+
+          python3 - "${IMAGE_PLAN}" "${SENDMAIL_SEC_RELEASE_REVISION}" "${SENDMAIL_SEC_IMAGE}" "${SENDMAIL_SEC_SOURCE_URL}" <<'PY'
+          import json
+          import re
+          import sys
+
+          plan_path = sys.argv[1]
+          revision = sys.argv[2]
+          image = sys.argv[3]
+          source = sys.argv[4]
+          plan = json.load(open(plan_path, encoding="utf-8"))
+          tag = plan["tag"]
+          kind = plan["kind"]
+          strict_tag = re.compile(
+              r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-beta\.(0|[1-9][0-9]*)|-build\.([0-9a-f]{8}))?$"
+          )
+
+          if tag.startswith("v") or not strict_tag.fullmatch(tag):
+              raise SystemExit(f"invalid strict sendmail-sec release tag: {tag}")
+          if kind not in ("stable", "beta", "build"):
+              raise SystemExit(f"invalid release kind: {kind}")
+          if plan["schemaVersion"] != 1:
+              raise SystemExit("unsupported image release plan schema")
+          if plan["image"] != image:
+              raise SystemExit(f"release image must publish to {image}")
+          if plan["tag"] != plan["version"]:
+              raise SystemExit("image plan version does not match release tag")
+          if plan["revision"] != revision:
+              raise SystemExit("image plan revision does not match checked-out commit")
+          if plan["source"] != source:
+              raise SystemExit("image plan source URL does not match workflow source")
+          if kind == "build" and not tag.endswith(revision[:8].lower()):
+              raise SystemExit(f"build release tag {tag} must end with revision prefix {revision[:8].lower()}")
+
+          major = tag.split(".", 1)[0]
+          expected = {
+              "amd64": ("sendmail-sec-alpine-musl-amd64-image", "sendmail-sec-alpine-musl-amd64.tar", "amd64"),
+              "arm64": ("sendmail-sec-alpine-musl-arm64-image", "sendmail-sec-alpine-musl-arm64.tar", "arm64"),
+              "riscv64": ("sendmail-sec-alpine-musl-riscv64-image", "sendmail-sec-alpine-musl-riscv64.tar", "riscv64"),
+          }
+
+          def expected_artifact_tags(arch):
+              tags = [f"{image}:{tag}-alpine-musl-{arch}"]
+              if kind == "stable":
+                  tags.append(f"{image}:{major}-alpine-musl-{arch}")
+              return tags
+
+          artifacts = {}
+          for artifact in plan["artifacts"]:
+              arch = artifact["artifactArch"]
+              if arch in artifacts:
+                  raise SystemExit(f"duplicate release artifact for {arch}")
+              artifacts[arch] = artifact
+          if set(artifacts) != set(expected):
+              raise SystemExit(f"unexpected artifact matrix: {sorted(artifacts)}")
+          for arch, (artifact_name, image_tar, docker_arch) in expected.items():
+              artifact = artifacts[arch]
+              if artifact["artifactName"] != artifact_name or artifact["imageTar"] != image_tar:
+                  raise SystemExit(f"unexpected artifact naming for {arch}")
+              if artifact["dockerArchitecture"] != docker_arch:
+                  raise SystemExit(f"unexpected docker architecture for {arch}")
+              expected_tags = expected_artifact_tags(arch)
+              if artifact["ghcrTags"] != expected_tags:
+                  raise SystemExit(f"unexpected GHCR tags for {arch}: {artifact['ghcrTags']!r}")
+
+          expected_manifests = {
+              "release": (["amd64", "arm64", "riscv64"], [f"{image}:{tag}"]),
+              "alpine-musl": (["amd64", "arm64", "riscv64"], [f"{image}:{tag}-alpine-musl"]),
+          }
+          if kind == "stable":
+              expected_manifests["release"][1].append(f"{image}:latest")
+              expected_manifests["alpine-musl"][1].extend([f"{image}:{major}-alpine-musl", f"{image}:alpine-musl"])
+          manifests = {}
+          for manifest in plan["manifests"]:
+              name = manifest["name"]
+              if name in manifests:
+                  raise SystemExit(f"duplicate release manifest for {name}")
+              manifests[name] = manifest
+          if set(manifests) != set(expected_manifests):
+              raise SystemExit(f"unexpected manifest matrix: {sorted(manifests)}")
+          for name, (artifact_archs, ghcr_tags) in expected_manifests.items():
+              manifest = manifests[name]
+              if manifest["artifactArchs"] != artifact_archs:
+                  raise SystemExit(f"unexpected manifest architectures for {name}")
+              if manifest["ghcrTags"] != ghcr_tags:
+                  raise SystemExit(f"unexpected manifest GHCR tags for {name}: {manifest['ghcrTags']!r}")
+          PY
+
+          {
+            echo "version=$(jq -r '.version' "${IMAGE_PLAN}")"
+            echo "kind=$(jq -r '.kind' "${IMAGE_PLAN}")"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify release worktree changes
+        run: |
+          set -euo pipefail
+
+          git diff --check HEAD --
+
+          unexpected_files="$(git diff --name-only HEAD -- . ':(exclude)Cargo.lock' ':(exclude)Cargo.toml')"
+          if [[ -n "${unexpected_files}" ]]; then
+            echo "unexpected release worktree changes:" >&2
+            printf '%s\n' "${unexpected_files}" >&2
+            exit 1
+          fi
+
+      - name: Prepare release metadata artifact
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/sendmail-sec-release-metadata"
+          cp Cargo.lock "${RUNNER_TEMP}/sendmail-sec-release-metadata/Cargo.lock"
+          cp Cargo.toml "${RUNNER_TEMP}/sendmail-sec-release-metadata/Cargo.toml"
+          cp "${RUNNER_TEMP}/sendmail-sec-release/image-plan.json" "${RUNNER_TEMP}/sendmail-sec-release-metadata/image-plan.json"
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sendmail-sec-release-metadata
+          path: ${{ runner.temp }}/sendmail-sec-release-metadata
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-alpine-musl-image:
+    name: Docker image (Alpine musl, ${{ matrix.artifact_arch }})
+    runs-on: ${{ matrix.runner }}
+    needs:
+      - validate
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - artifact_arch: amd64
+            artifact_name: sendmail-sec-alpine-musl-amd64-image
+            image_tar: sendmail-sec-alpine-musl-amd64.tar
             platform: linux/amd64
             runner: ubuntu-latest
             qemu_platforms: ""
-            rust_builder_image: rust:1.94-alpine
-          - arch: arm64
+          - artifact_arch: arm64
+            artifact_name: sendmail-sec-alpine-musl-arm64-image
+            image_tar: sendmail-sec-alpine-musl-arm64.tar
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             qemu_platforms: ""
-            rust_builder_image: rust:1.94-alpine
-          - arch: riscv64
+          - artifact_arch: riscv64
+            artifact_name: sendmail-sec-alpine-musl-riscv64-image
+            image_tar: sendmail-sec-alpine-musl-riscv64.tar
             platform: linux/riscv64
             runner: ubuntu-latest
             qemu_platforms: riscv64
-            rust_builder_image: rust:1.94-trixie
 
     steps:
-      - name: Checkout
+      - name: Checkout release ref
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
+
+      - name: Download release metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sendmail-sec-release-metadata
+          path: ${{ runner.temp }}/sendmail-sec-release-metadata
+
+      - name: Apply release metadata
+        run: |
+          set -euo pipefail
+          cp "${RUNNER_TEMP}/sendmail-sec-release-metadata/Cargo.lock" Cargo.lock
+          cp "${RUNNER_TEMP}/sendmail-sec-release-metadata/Cargo.toml" Cargo.toml
 
       - name: Set up QEMU
         if: matrix.qemu_platforms != ''
@@ -101,99 +271,341 @@ jobs:
         with:
           platforms: ${{ matrix.qemu_platforms }}
 
+      - name: Pre-pull Docker BuildKit image
+        run: scripts/retry-docker-pull.sh moby/buildkit:buildx-stable-1
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker labels
-        id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
-        with:
-          images: ${{ needs.validate.outputs.image }}
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=${{ needs.validate.outputs.tag }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-
-      - name: Build and push image by digest
-        id: build
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            RUST_BUILDER_IMAGE=${{ matrix.rust_builder_image }}
-            OCI_SOURCE=${{ github.server_url }}/${{ github.repository }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-          tags: ${{ needs.validate.outputs.image }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: false
-
-      - name: Export digest
+      - name: Build Docker image artifact
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          SENDMAIL_SEC_DOCKER_IMAGE_CREATED: ${{ needs.validate.outputs.created }}
+          SENDMAIL_SEC_DOCKER_IMAGE_REF_NAME: ${{ needs.validate.outputs.version }}
+          SENDMAIL_SEC_DOCKER_IMAGE_REVISION: ${{ needs.validate.outputs.revision }}
+          SENDMAIL_SEC_DOCKER_IMAGE_SOURCE: ${{ env.SENDMAIL_SEC_SOURCE_URL }}
+          SENDMAIL_SEC_DOCKER_IMAGE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          mkdir -p "${RUNNER_TEMP}/digests"
-          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+          scripts/build-docker-image-artifact.sh \
+            "${{ matrix.platform }}" \
+            "${{ matrix.artifact_arch }}" \
+            "${RUNNER_TEMP}/sendmail-sec-image"
 
-      - name: Upload digest
+      - name: Upload Docker image artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digests-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
+          name: ${{ matrix.artifact_name }}
+          path: ${{ runner.temp }}/sendmail-sec-image/${{ matrix.image_tar }}
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: Publish Docker manifest
+  docker-image-trivy-scan:
+    name: Docker image Trivy scan (${{ matrix.artifact_arch }})
+    runs-on: ubuntu-latest
+    needs:
+      - docker-alpine-musl-image
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_arch: amd64
+            artifact_name: sendmail-sec-alpine-musl-amd64-image
+            image_tar: sendmail-sec-alpine-musl-amd64.tar
+            image_tag: sendmail-sec:alpine-musl-amd64
+            scan_target: linux/amd64
+          - artifact_arch: arm64
+            artifact_name: sendmail-sec-alpine-musl-arm64-image
+            image_tar: sendmail-sec-alpine-musl-arm64.tar
+            image_tag: sendmail-sec:alpine-musl-arm64
+            scan_target: linux/arm64
+          - artifact_arch: riscv64
+            artifact_name: sendmail-sec-alpine-musl-riscv64-image
+            image_tar: sendmail-sec-alpine-musl-riscv64.tar
+            image_tag: sendmail-sec:alpine-musl-riscv64
+            scan_target: linux/riscv64
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ runner.temp }}/sendmail-sec-image/${{ matrix.artifact_arch }}
+
+      - name: Load Docker image
+        env:
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+          IMAGE_TAR: ${{ matrix.image_tar }}
+        run: docker load --input "${RUNNER_TEMP}/sendmail-sec-image/${ARTIFACT_ARCH}/${IMAGE_TAR}"
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.image_tag }}
+          format: json
+          output: trivy-results-${{ matrix.artifact_arch }}.json
+          vuln-type: os,library
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Append Trivy vulnerability table
+        env:
+          IMAGE_TAG: ${{ matrix.image_tag }}
+          SCAN_TARGET: ${{ matrix.scan_target }}
+          TRIVY_JSON: trivy-results-${{ matrix.artifact_arch }}.json
+        run: |
+          {
+            echo "### Trivy image scan: \`${IMAGE_TAG}\`"
+            echo
+            echo "| Image | Target | Package | Installed | Fixed | Severity | Vulnerability | Title |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- |"
+            rows="$(
+              jq -r --arg image "${IMAGE_TAG}" --arg default_target "${SCAN_TARGET}" '
+                def cell:
+                  tostring
+                  | gsub("\\|"; "\\|")
+                  | gsub("[\r\n]+"; " ");
+                .Results[]? as $result
+                | ($result.Target // $default_target) as $target
+                | $result.Vulnerabilities[]?
+                | [
+                    $image,
+                    $target,
+                    (.PkgName // ""),
+                    (.InstalledVersion // ""),
+                    (.FixedVersion // ""),
+                    (.Severity // ""),
+                    (.VulnerabilityID // ""),
+                    (.Title // "")
+                  ]
+                | map(cell)
+                | "| \(.[0]) | \(.[1]) | \(.[2]) | \(.[3]) | \(.[4]) | \(.[5]) | \(.[6]) | \(.[7]) |"
+              ' "${TRIVY_JSON}"
+            )"
+            if [[ -z "${rows}" ]]; then
+              echo "| ${IMAGE_TAG} | ${SCAN_TARGET} | none | - | - | - | - | No vulnerabilities reported |"
+            else
+              printf '%s\n' "${rows}"
+            fi
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload Trivy vulnerability report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-release-sendmail-sec-${{ matrix.artifact_arch }}-json
+          path: trivy-results-${{ matrix.artifact_arch }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+  ghcr-publish:
+    name: Publish GHCR images
+    runs-on: ubuntu-latest
     needs:
       - validate
-      - build
-    runs-on: ubuntu-latest
+      - docker-alpine-musl-image
+      - docker-image-trivy-scan
+    if: github.repository == 'digitalBelt/sendmail-sec'
     permissions:
+      actions: read
       contents: read
       packages: write
 
     steps:
-      - name: Download digests
+      - name: Download release metadata
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: digests-*
-          path: ${{ runner.temp }}/digests
-          merge-multiple: true
+          name: sendmail-sec-release-metadata
+          path: ${{ runner.temp }}/sendmail-sec-release-metadata
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+      - name: Download Docker image artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          pattern: sendmail-sec-alpine-musl-*-image
+          path: ${{ runner.temp }}/sendmail-sec-images
 
-      - name: Create and push manifest
+      - name: Validate Docker image artifacts
         env:
-          IMAGE_NAME: ${{ needs.validate.outputs.image }}
-          TAGS: ${{ needs.validate.outputs.tags }}
+          IMAGE_ROOT: ${{ runner.temp }}/sendmail-sec-images
+          METADATA_ROOT: ${{ runner.temp }}/sendmail-sec-release-metadata
+          SENDMAIL_SEC_IMAGE: ${{ env.SENDMAIL_SEC_GHCR_IMAGE }}
+          SENDMAIL_SEC_RELEASE_KIND: ${{ needs.validate.outputs.kind }}
+          SENDMAIL_SEC_RELEASE_REVISION: ${{ needs.validate.outputs.revision }}
+          SENDMAIL_SEC_RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          SENDMAIL_SEC_SOURCE_URL: ${{ env.SENDMAIL_SEC_SOURCE_URL }}
         run: |
-          tag_args=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && tag_args+=("-t" "$tag")
-          done <<< "$TAGS"
+          set -euo pipefail
 
-          sources=()
-          for digest_file in "${RUNNER_TEMP}"/digests/*; do
-            sources+=("${IMAGE_NAME}@sha256:$(basename "$digest_file")")
+          python3 - "${METADATA_ROOT}/image-plan.json" "${IMAGE_ROOT}" "${SENDMAIL_SEC_RELEASE_VERSION}" "${SENDMAIL_SEC_RELEASE_KIND}" "${SENDMAIL_SEC_RELEASE_REVISION}" "${SENDMAIL_SEC_SOURCE_URL}" "${SENDMAIL_SEC_IMAGE}" <<'PY'
+          import json
+          import pathlib
+          import sys
+          import tarfile
+
+          plan_path = pathlib.Path(sys.argv[1])
+          image_root = pathlib.Path(sys.argv[2])
+          version = sys.argv[3]
+          kind = sys.argv[4]
+          revision = sys.argv[5]
+          source = sys.argv[6]
+          image = sys.argv[7]
+          plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+          if kind not in ("stable", "beta", "build"):
+              raise SystemExit(f"invalid release kind: {kind}")
+          if plan["schemaVersion"] != 1:
+              raise SystemExit("unsupported image release plan schema")
+          if plan["image"] != image:
+              raise SystemExit(f"release image must publish to {image}")
+          if plan["tag"] != version or plan["version"] != version or plan["kind"] != kind or plan["revision"] != revision:
+              raise SystemExit("release plan identity does not match workflow outputs")
+          if plan["source"] != source:
+              raise SystemExit("release plan source URL does not match workflow source")
+
+          major = version.split(".", 1)[0]
+          expected = {
+              "amd64": ("sendmail-sec-alpine-musl-amd64-image", "sendmail-sec-alpine-musl-amd64.tar", "amd64"),
+              "arm64": ("sendmail-sec-alpine-musl-arm64-image", "sendmail-sec-alpine-musl-arm64.tar", "arm64"),
+              "riscv64": ("sendmail-sec-alpine-musl-riscv64-image", "sendmail-sec-alpine-musl-riscv64.tar", "riscv64"),
+          }
+
+          def expected_artifact_tags(arch):
+              tags = [f"{image}:{version}-alpine-musl-{arch}"]
+              if kind == "stable":
+                  tags.append(f"{image}:{major}-alpine-musl-{arch}")
+              return tags
+
+          artifacts = {}
+          for artifact in plan["artifacts"]:
+              arch = artifact["artifactArch"]
+              if arch in artifacts:
+                  raise SystemExit(f"duplicate release artifact for {arch}")
+              artifacts[arch] = artifact
+          if set(artifacts) != set(expected):
+              raise SystemExit(f"unexpected artifact matrix: {sorted(artifacts)}")
+          for arch, (artifact_name, image_tar, docker_arch) in expected.items():
+              artifact = artifacts[arch]
+              if artifact["artifactName"] != artifact_name or artifact["imageTar"] != image_tar:
+                  raise SystemExit(f"unexpected artifact naming for {arch}")
+              if artifact["dockerArchitecture"] != docker_arch:
+                  raise SystemExit(f"unexpected docker architecture for {arch}")
+              expected_tags = expected_artifact_tags(arch)
+              if artifact["ghcrTags"] != expected_tags:
+                  raise SystemExit(f"unexpected GHCR tags for {arch}: {artifact['ghcrTags']!r}")
+
+          expected_manifests = {
+              "release": (["amd64", "arm64", "riscv64"], [f"{image}:{version}"]),
+              "alpine-musl": (["amd64", "arm64", "riscv64"], [f"{image}:{version}-alpine-musl"]),
+          }
+          if kind == "stable":
+              expected_manifests["release"][1].append(f"{image}:latest")
+              expected_manifests["alpine-musl"][1].extend([f"{image}:{major}-alpine-musl", f"{image}:alpine-musl"])
+          manifests = {}
+          for manifest in plan["manifests"]:
+              name = manifest["name"]
+              if name in manifests:
+                  raise SystemExit(f"duplicate release manifest for {name}")
+              manifests[name] = manifest
+          if set(manifests) != set(expected_manifests):
+              raise SystemExit(f"unexpected manifest matrix: {sorted(manifests)}")
+          for name, (artifact_archs, ghcr_tags) in expected_manifests.items():
+              manifest = manifests[name]
+              if manifest["artifactArchs"] != artifact_archs:
+                  raise SystemExit(f"unexpected manifest architectures for {name}")
+              if manifest["ghcrTags"] != ghcr_tags:
+                  raise SystemExit(f"unexpected manifest GHCR tags for {name}: {manifest['ghcrTags']!r}")
+
+          expected_artifacts = {artifact["artifactName"] for artifact in artifacts.values()}
+          actual_artifacts = {path.name for path in image_root.iterdir() if path.is_dir()}
+          if actual_artifacts != expected_artifacts:
+              raise SystemExit(f"unexpected downloaded image artifacts: {sorted(actual_artifacts)}")
+
+          for artifact in artifacts.values():
+              image_tar = image_root / artifact["artifactName"] / artifact["imageTar"]
+              if not image_tar.is_file():
+                  raise SystemExit(f"missing Docker image tar: {image_tar}")
+              with tarfile.open(image_tar) as docker_tar:
+                  manifest_member = docker_tar.extractfile("manifest.json")
+                  if manifest_member is None:
+                      raise SystemExit(f"{image_tar} is missing manifest.json")
+                  manifest = json.load(manifest_member)
+                  if len(manifest) != 1:
+                      raise SystemExit(f"{image_tar} should contain exactly one image")
+                  config_member = docker_tar.extractfile(manifest[0]["Config"])
+                  if config_member is None:
+                      raise SystemExit(f"{image_tar} is missing image config")
+                  config = json.load(config_member)
+
+              labels = config.get("config", {}).get("Labels", {})
+              for key, expected_label in {
+                  "org.opencontainers.image.version": version,
+                  "org.opencontainers.image.ref.name": version,
+                  "org.opencontainers.image.revision": revision,
+                  "org.opencontainers.image.source": source,
+                  "org.opencontainers.image.url": source,
+                  "org.opencontainers.image.licenses": "MIT",
+              }.items():
+                  if labels.get(key) != expected_label:
+                      raise SystemExit(f"{image_tar} label {key} was {labels.get(key)!r}, expected {expected_label!r}")
+              if config.get("architecture") != artifact["dockerArchitecture"]:
+                  raise SystemExit(f"{image_tar} architecture does not match release plan")
+              image_config = config.get("config", {})
+              if image_config.get("Entrypoint") != ["/usr/local/bin/sendmail-sec"]:
+                  raise SystemExit(f"{image_tar} has unexpected entrypoint: {image_config.get('Entrypoint')}")
+              if image_config.get("Cmd") != ["--config", "/config/sendmail-sec.yaml"]:
+                  raise SystemExit(f"{image_tar} has unexpected command: {image_config.get('Cmd')}")
+              if image_config.get("User") != "app:app":
+                  raise SystemExit(f"{image_tar} has unexpected user: {image_config.get('User')}")
+          PY
+
+      - name: Load, tag, and push arch images
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_PLAN: ${{ runner.temp }}/sendmail-sec-release-metadata/image-plan.json
+          IMAGE_ROOT: ${{ runner.temp }}/sendmail-sec-images
+        run: |
+          set -euo pipefail
+
+          printf '%s' "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+          jq -r '.artifacts[] | @base64' "${IMAGE_PLAN}" | while read -r artifact_b64; do
+            artifact_json="$(printf '%s' "${artifact_b64}" | base64 --decode)"
+            artifact_name="$(jq -r '.artifactName' <<<"${artifact_json}")"
+            image_tar="$(jq -r '.imageTar' <<<"${artifact_json}")"
+            local_tag="$(jq -r '.localTag' <<<"${artifact_json}")"
+
+            docker load --input "${IMAGE_ROOT}/${artifact_name}/${image_tar}"
+            jq -r '.ghcrTags[]' <<<"${artifact_json}" | while read -r ghcr_tag; do
+              docker tag "${local_tag}" "${ghcr_tag}"
+              docker push "${ghcr_tag}"
+            done
           done
 
-          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+      - name: Publish multi-arch manifests
+        env:
+          IMAGE_PLAN: ${{ runner.temp }}/sendmail-sec-release-metadata/image-plan.json
+        run: |
+          set -euo pipefail
+
+          jq -r '.manifests[] | @base64' "${IMAGE_PLAN}" | while read -r manifest_b64; do
+            manifest_json="$(printf '%s' "${manifest_b64}" | base64 --decode)"
+            mapfile -t manifest_tags < <(jq -r '.ghcrTags[]' <<<"${manifest_json}")
+            mapfile -t source_tags < <(
+              jq -r --argjson manifest "${manifest_json}" '
+                .artifacts as $artifacts
+                | $manifest.artifactArchs[]
+                | . as $artifact_arch
+                | $artifacts[]
+                | select(.artifactArch == $artifact_arch)
+                | .ghcrTags[0]
+              ' "${IMAGE_PLAN}"
+            )
+
+            for manifest_tag in "${manifest_tags[@]}"; do
+              docker manifest rm "${manifest_tag}" >/dev/null 2>&1 || true
+              docker manifest create "${manifest_tag}" "${source_tags[@]}"
+              docker manifest push "${manifest_tag}"
+            done
+          done

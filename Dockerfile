@@ -2,6 +2,11 @@
 
 ARG RUST_BUILDER_IMAGE=rust:1.94-alpine
 ARG ALPINE_VERSION=3.22
+ARG SENDMAIL_SEC_VERSION=dev
+ARG SENDMAIL_SEC_REVISION=unknown
+ARG SENDMAIL_SEC_CREATED=1970-01-01T00:00:00Z
+ARG SENDMAIL_SEC_SOURCE=https://github.com/digitalBelt/sendmail-sec
+ARG SENDMAIL_SEC_REF_NAME=dev
 
 FROM --platform=$TARGETPLATFORM ${RUST_BUILDER_IMAGE} AS builder
 
@@ -55,9 +60,21 @@ RUN RUST_TARGET="$(cat /tmp/rust-target)" && \
 
 FROM --platform=$TARGETPLATFORM alpine:${ALPINE_VERSION}
 
-ARG OCI_SOURCE=""
+ARG SENDMAIL_SEC_VERSION
+ARG SENDMAIL_SEC_REVISION
+ARG SENDMAIL_SEC_CREATED
+ARG SENDMAIL_SEC_SOURCE
+ARG SENDMAIL_SEC_REF_NAME
 
-LABEL org.opencontainers.image.source="${OCI_SOURCE}"
+LABEL org.opencontainers.image.title="sendmail-sec" \
+      org.opencontainers.image.description="Authenticated local SMTP OpenPGP encryption relay" \
+      org.opencontainers.image.source="${SENDMAIL_SEC_SOURCE}" \
+      org.opencontainers.image.url="${SENDMAIL_SEC_SOURCE}" \
+      org.opencontainers.image.version="${SENDMAIL_SEC_VERSION}" \
+      org.opencontainers.image.ref.name="${SENDMAIL_SEC_REF_NAME}" \
+      org.opencontainers.image.revision="${SENDMAIL_SEC_REVISION}" \
+      org.opencontainers.image.created="${SENDMAIL_SEC_CREATED}" \
+      org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 

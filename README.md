@@ -103,6 +103,13 @@ docker buildx build \
   -t sendmail-sec .
 ```
 
+Build a release-style Docker image tarball for one architecture:
+
+```bash
+scripts/build-docker-image-artifact.sh linux/amd64 amd64 /tmp/sendmail-sec-image
+docker load --input /tmp/sendmail-sec-image/sendmail-sec-alpine-musl-amd64.tar
+```
+
 Run with a read-only root filesystem and no Linux capabilities:
 
 ```bash
@@ -135,7 +142,18 @@ The integration test builds a temporary image, generates temporary OpenPGP and T
 
 ## Release Automation
 
-- A semver tag such as `2.1.2` or `1.1.0-beta.1` triggers GitHub Actions to build release binaries for all supported GNU and musl targets.
-- Those binary builds are uploaded as workflow artifacts immediately after the tag push so they exist before an immutable GitHub Release is published.
-- Docker images are built and published only when a GitHub Release is published.
-- The Docker workflow publishes a multi-arch Alpine image for `linux/amd64`, `linux/arm64`, and `linux/riscv64`.
+- Docker releases publish to `ghcr.io/digitalbelt/sendmail-sec` from the canonical `digitalBelt/sendmail-sec` repository.
+- Strict tags are required: `2.1.2`, `1.1.0-beta.1`, or `1.1.0-build.4f43abcd`. `v`-prefixed tags and unsupported prerelease names are rejected.
+- Stable releases publish `latest`, `<major>-alpine-musl`, and per-architecture `<major>-alpine-musl-<arch>` aliases. Beta and build releases publish only versioned tags.
+- Release CI validates the tag, updates Cargo release metadata in the CI worktree, builds per-architecture Docker image tar artifacts, runs Trivy image scans, and only then pushes arch tags and multi-arch manifests.
+- The Docker workflow publishes Alpine musl images for `linux/amd64`, `linux/arm64`, and `linux/riscv64`.
+
+Run DevOps validation locally after changing release automation:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+pnpm run versioning:check
+```

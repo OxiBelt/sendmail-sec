@@ -1,1 +1,6 @@
 /target
+/node_modules
+**/node_modules
+/devops/dist
+*.tsbuildinfo
+**/*.tsbuildinfo

@@ -38,8 +38,10 @@ by default.
   - Static musl release image build and runtime layout.
 - `scripts/docker-integration-test.sh`
   - End-to-end Docker SMTP, TLS, and OpenPGP integration test.
+- `devops/`
+  - TypeScript release versioning and Docker image plan tooling.
 - `.github/workflows/`
-  - GitHub Actions checks and Docker release workflow.
+  - GitHub Actions checks, CodeQL analysis, and Docker release workflow.
 
 ## Common Commands
 
@@ -49,6 +51,7 @@ by default.
 - Build locally: `cargo build --locked`
 - Build the Docker image: `docker build -t sendmail-sec .`
 - Run the Docker integration test: `scripts/docker-integration-test.sh`
+- DevOps checks: `pnpm install --frozen-lockfile && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run versioning:check`
 
 ## Contributor Guidance
 
@@ -91,6 +94,14 @@ reason.
 - Keep test fixtures isolated from external services. Use local containers and
   generated local trust roots rather than public keyservers or real SMTP
   providers.
+
+## Release DevOps
+
+Docker release automation uses TypeScript tooling under `devops/` to validate
+strict release tags, update Cargo release metadata during CI, and emit the
+image plan consumed by `.github/workflows/release-docker.yml`. Release images
+publish to `ghcr.io/digitalbelt/sendmail-sec` only from the canonical
+`digitalBelt/sendmail-sec` repository.
 
 ## Editing Notes
 

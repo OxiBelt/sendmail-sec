@@ -4,12 +4,44 @@ on:
   push:
     branches:
       - "**"
+  pull_request:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
 
 jobs:
+  devops:
+    name: DevOps checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.10.0 --activate
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: DevOps lint
+        run: pnpm run lint
+
+      - name: DevOps typecheck
+        run: pnpm run typecheck
+
+      - name: DevOps tests
+        run: pnpm run test
+
+      - name: Versioning check
+        run: pnpm run versioning:check
+
   unit-tests:
     name: Unit tests (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
@@ -53,17 +85,17 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-latest
             qemu_platforms: ""
-            rust_builder_image: rust:1.94-alpine
+            image_tar: sendmail-sec-alpine-musl-amd64.tar
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             qemu_platforms: ""
-            rust_builder_image: rust:1.94-alpine
+            image_tar: sendmail-sec-alpine-musl-arm64.tar
           - arch: riscv64
             platform: linux/riscv64
             runner: ubuntu-latest
             qemu_platforms: riscv64
-            rust_builder_image: rust:1.94-trixie
+            image_tar: sendmail-sec-alpine-musl-riscv64.tar
 
     steps:
       - name: Checkout
@@ -75,21 +107,21 @@ jobs:
         with:
           platforms: ${{ matrix.qemu_platforms }}
 
+      - name: Pre-pull Docker BuildKit image
+        run: scripts/retry-docker-pull.sh moby/buildkit:buildx-stable-1
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      - name: Build Docker image
-        env:
-          IMAGE_TAG: sendmail-sec:ci-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-          PLATFORM: ${{ matrix.platform }}
-          RUST_BUILDER_IMAGE: ${{ matrix.rust_builder_image }}
+      - name: Build Docker image artifact
         run: |
-          docker buildx build \
-            --platform "${PLATFORM}" \
-            --build-arg "RUST_BUILDER_IMAGE=${RUST_BUILDER_IMAGE}" \
-            --tag "${IMAGE_TAG}" \
-            --load \
-            .
+          scripts/build-docker-image-artifact.sh \
+            "${{ matrix.platform }}" \
+            "${{ matrix.arch }}" \
+            "${RUNNER_TEMP}/sendmail-sec-image"
+
+      - name: Load Docker image artifact
+        run: docker load --input "${RUNNER_TEMP}/sendmail-sec-image/${{ matrix.image_tar }}"
 
       # The riscv64 image is executed through QEMU on GitHub's amd64 runner.
       # Native amd64/arm64 jobs cover TLS relay behavior; riscv64 gets a
@@ -97,13 +129,13 @@ jobs:
       - name: Run Docker integration test
         if: matrix.arch != 'riscv64'
         env:
-          APP_IMAGE: sendmail-sec:ci-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          APP_IMAGE: sendmail-sec:alpine-musl-${{ matrix.arch }}
           APP_IMAGE_CLEANUP: "1"
         run: scripts/docker-integration-test.sh
 
       - name: Run Docker smoke test
         if: matrix.arch == 'riscv64'
         env:
-          IMAGE_TAG: sendmail-sec:ci-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          IMAGE_TAG: sendmail-sec:alpine-musl-${{ matrix.arch }}
           PLATFORM: ${{ matrix.platform }}
         run: docker run --rm --platform "${PLATFORM}" "${IMAGE_TAG}" --help >/dev/null

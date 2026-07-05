@@ -13,8 +13,9 @@ the text explicitly says the command is being run from `sources/`.
 
 ## Repository Layout
 
-Generated and local-only directories such as `target/` and temporary Docker or
-test output are not source contributions and should not be committed.
+Generated and local-only directories such as `target/`, `node_modules/`, and
+temporary Docker or test output are not source contributions and should not be
+committed.
 
 | Path | Purpose | Change here when |
 | --- | --- | --- |
@@ -30,6 +31,8 @@ test output are not source contributions and should not be committed.
 | `examples/` | Example YAML and JSON configuration. | User-visible configuration keys, defaults, or examples change. |
 | `Dockerfile` | Release container image. | Runtime image, build targets, package dependencies, entrypoint, user, or container layout changes. |
 | `scripts/docker-integration-test.sh` | End-to-end Docker integration test. | Containerized SMTP relay behavior, Docker fixtures, generated OpenPGP/TLS materials, or cleanup flow changes. |
+| `scripts/build-docker-image-artifact.sh` | Release-style Docker image tarball builder. | CI image artifacts, OCI labels, architecture matrix, or release image layout changes. |
+| `devops/` | TypeScript release versioning and Docker image plan tooling. | Release tag validation, Cargo release metadata, GHCR tag planning, or DevOps tests change. |
 | `.github/workflows/` | GitHub Actions workflows. | CI checks, release image publishing, build matrix, or required workflow behavior changes. |
 | `README.md` | User-facing overview, build, configuration, container, and release notes. | Setup, usage, high-level behavior, configuration, or release documentation changes. |
 
@@ -64,6 +67,17 @@ Docker test fixture:
 ```sh
 docker build -t sendmail-sec .
 scripts/docker-integration-test.sh
+```
+
+Run DevOps checks when release versioning, GHCR image publishing, workflow
+metadata, or TypeScript automation changes:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+pnpm run versioning:check
 ```
 
 Validate configuration examples after changing config syntax or defaults. At a
@@ -309,9 +323,9 @@ reason to continue.
 - Do not remove tests just to make CI pass.
 - Do not disable TLS, SMTP, OpenPGP, configuration, or Docker integration tests
   without a documented reason.
-- Do not commit `target/`, generated build artifacts, generated certificates,
-  private keys, OpenPGP private keys, temporary configs, logs, captures, or
-  decrypted test output unless explicitly required.
+- Do not commit `target/`, generated build artifacts, `node_modules/`,
+  generated certificates, private keys, OpenPGP private keys, temporary
+  configs, logs, captures, or decrypted test output unless explicitly required.
 - Do not make CI depend on local-only files or absolute host paths.
 - Do not silently change public SMTP, TLS, OpenPGP, or configuration behavior.
 - Do not change configuration syntax without updating examples, docs, and tests

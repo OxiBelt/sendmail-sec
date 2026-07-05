@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "module": "NodeNext",
+    "target": "ES2024",
+    "moduleResolution": "NodeNext",
+    "removeComments": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "types": ["node"],
+    "ignoreDeprecations": "6.0"
+  },
+  "include": ["devops/sources/**/*.ts", "devops/tests/**/*.ts"]
+}

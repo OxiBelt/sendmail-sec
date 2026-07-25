@@ -32,6 +32,7 @@ committed.
 | `Dockerfile` | Release container image. | Runtime image, build targets, package dependencies, entrypoint, user, or container layout changes. |
 | `scripts/docker-integration-test.sh` | End-to-end Docker integration test. | Containerized SMTP relay behavior, Docker fixtures, generated OpenPGP/TLS materials, or cleanup flow changes. |
 | `scripts/build-docker-image-artifact.sh` | Release-style Docker image tarball builder. | CI image artifacts, OCI labels, architecture matrix, or release image layout changes. |
+| `scripts/verify-docker-image.sh` | Static Docker image and binary verifier. | Image metadata, runtime layout, architecture, or static-linking validation changes. |
 | `devops/` | TypeScript release versioning and Docker image plan tooling. | Release tag validation, Cargo release metadata, GHCR tag planning, or DevOps tests change. |
 | `.github/workflows/` | GitHub Actions workflows. | CI checks, release image publishing, build matrix, or required workflow behavior changes. |
 | `README.md` | User-facing overview, build, configuration, container, and release notes. | Setup, usage, high-level behavior, configuration, or release documentation changes. |
@@ -75,6 +76,15 @@ Docker test fixture:
 ```sh
 docker build -t sendmail-sec .
 scripts/docker-integration-test.sh
+```
+
+For release-style per-architecture builds, load and verify the generated image
+before running architecture-specific runtime tests:
+
+```sh
+scripts/build-docker-image-artifact.sh linux/amd64 amd64 /tmp/sendmail-sec-image
+docker load --input /tmp/sendmail-sec-image/sendmail-sec-alpine-musl-amd64.tar
+scripts/verify-docker-image.sh sendmail-sec:alpine-musl-amd64 amd64
 ```
 
 Run DevOps checks when release versioning, GHCR image publishing, workflow
@@ -233,6 +243,10 @@ When changing Docker behavior:
 - Avoid depending on host-installed services.
 - Keep Docker builds reproducible.
 - Prefer explicit package versions when practical.
+- Keep cross-compilation in build jobs independent of target-architecture
+  emulation; isolate any QEMU runtime checks to completed image artifacts.
+- Verify image architecture, runtime metadata, ELF machine type, and static
+  linkage with `scripts/verify-docker-image.sh`.
 - Make Docker-based tests work in CI.
 - Do not assume local-only paths outside the repository.
 - Clean up Docker resources created by tests.

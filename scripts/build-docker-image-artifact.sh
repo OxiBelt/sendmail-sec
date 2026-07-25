@@ -44,7 +44,6 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 image_tag="sendmail-sec:alpine-musl-${artifact_arch}"
 image_tar="${output_dir%/}/sendmail-sec-alpine-musl-${artifact_arch}.tar"
-rust_builder_image="rust:1.97-alpine3.24"
 sendmail_sec_version="$(
   sed -n 's/^version = "\(.*\)"/\1/p' "${repo_root}/Cargo.toml" | head -n 1
 )"
@@ -72,7 +71,6 @@ case "${artifact_arch}" in
       usage
       exit 2
     }
-    rust_builder_image="rust:1.97-trixie"
     ;;
   *)
     usage
@@ -97,7 +95,6 @@ mkdir -p "${output_dir}"
 docker buildx build \
   --platform "${platform}" \
   --file "${repo_root}/Dockerfile" \
-  --build-arg "RUST_BUILDER_IMAGE=${rust_builder_image}" \
   --build-arg "SENDMAIL_SEC_VERSION=${sendmail_sec_version}" \
   --build-arg "SENDMAIL_SEC_REVISION=${sendmail_sec_revision}" \
   --build-arg "SENDMAIL_SEC_CREATED=${sendmail_sec_created}" \

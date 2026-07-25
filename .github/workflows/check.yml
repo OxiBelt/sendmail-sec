@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -62,6 +64,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Cargo
         run: |
@@ -89,28 +93,21 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
-            qemu_platforms: ""
             image_tar: sendmail-sec-alpine-musl-amd64.tar
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-            qemu_platforms: ""
             image_tar: sendmail-sec-alpine-musl-arm64.tar
           - arch: riscv64
             platform: linux/riscv64
             runner: ubuntu-24.04
-            qemu_platforms: riscv64
             image_tar: sendmail-sec-alpine-musl-riscv64.tar
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up QEMU
-        if: matrix.qemu_platforms != ''
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
-          platforms: ${{ matrix.qemu_platforms }}
+          persist-credentials: false
 
       - name: Pre-pull Docker BuildKit image
         run: scripts/retry-docker-pull.sh moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
@@ -130,9 +127,9 @@ jobs:
       - name: Load Docker image artifact
         run: docker load --input "${RUNNER_TEMP}/sendmail-sec-image/${{ matrix.image_tar }}"
 
-      # The riscv64 image is executed through QEMU on GitHub's amd64 runner.
-      # Native amd64/arm64 jobs cover TLS relay behavior; riscv64 gets a
-      # container startup smoke test below.
+      - name: Verify Docker image artifact
+        run: scripts/verify-docker-image.sh "sendmail-sec:alpine-musl-${{ matrix.arch }}" "${{ matrix.arch }}"
+
       - name: Run Docker integration tests
         if: matrix.arch != 'riscv64'
         env:
@@ -143,9 +140,55 @@ jobs:
           REMOTE_TLS_MODE=wrapper scripts/docker-integration-test.sh
           REMOTE_TLS_MODE=starttls scripts/docker-integration-test.sh
 
-      - name: Run Docker smoke test
+      - name: Upload RISC-V Docker image artifact
         if: matrix.arch == 'riscv64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sendmail-sec-check-riscv64-image
+          path: ${{ runner.temp }}/sendmail-sec-image/${{ matrix.image_tar }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Clean up Docker image
+        if: always()
+        run: docker image rm -f "sendmail-sec:alpine-musl-${{ matrix.arch }}" >/dev/null 2>&1 || true
+
+  docker-riscv64-smoke:
+    name: Docker image runtime smoke (riscv64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs:
+      - docker-image
+    permissions:
+      actions: read
+
+    steps:
+      - name: Download RISC-V Docker image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sendmail-sec-check-riscv64-image
+          path: ${{ runner.temp }}/sendmail-sec-image
+
+      - name: Set up RISC-V emulation
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          cache-image: false
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: riscv64
+
+      - name: Run RISC-V Docker smoke test
         env:
-          IMAGE_TAG: sendmail-sec:alpine-musl-${{ matrix.arch }}
-          PLATFORM: ${{ matrix.platform }}
-        run: docker run --rm --platform "${PLATFORM}" "${IMAGE_TAG}" --help >/dev/null
+          IMAGE_TAG: sendmail-sec:alpine-musl-riscv64
+          IMAGE_TAR: ${{ runner.temp }}/sendmail-sec-image/sendmail-sec-alpine-musl-riscv64.tar
+        run: |
+          set -Eeuo pipefail
+          trap 'docker image rm -f "${IMAGE_TAG}" >/dev/null 2>&1 || true' EXIT
+          docker load --input "${IMAGE_TAR}"
+          docker run --rm \
+            --platform linux/riscv64 \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            "${IMAGE_TAG}" \
+            --help >/dev/null

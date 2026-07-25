@@ -108,7 +108,14 @@ Build a release-style Docker image tarball for one architecture:
 ```bash
 scripts/build-docker-image-artifact.sh linux/amd64 amd64 /tmp/sendmail-sec-image
 docker load --input /tmp/sendmail-sec-image/sendmail-sec-alpine-musl-amd64.tar
+scripts/verify-docker-image.sh sendmail-sec:alpine-musl-amd64 amd64
 ```
+
+The Dockerfile builds `amd64` and `arm64` natively on their matching runners.
+It cross-compiles `riscv64` on the Buildx host with a pinned
+`cargo-zigbuild`/Zig tool image, so the RISC-V build does not execute compiler
+processes through QEMU. The final Alpine image is assembled without
+target-architecture `RUN` instructions.
 
 Run with a read-only root filesystem and no Linux capabilities:
 
@@ -143,7 +150,7 @@ The integration test builds a temporary image, generates temporary OpenPGP and T
 - The process does not require write access beyond optional `/tmp`.
 - Logs are written to stdout/stderr.
 - Local key files are loaded at startup. Restart the container after changing mounted key material.
-- The Docker image builds a static musl binary on Alpine for `amd64`, `arm64`, and `riscv64`.
+- The Docker image contains a static musl binary for `amd64`, `arm64`, and `riscv64`.
 - The Rust crate entry point now lives under `sources/` rather than `src/`.
 
 ## Release Automation
@@ -151,7 +158,7 @@ The integration test builds a temporary image, generates temporary OpenPGP and T
 - Docker releases publish to `ghcr.io/digitalbelt/sendmail-sec` from the canonical `digitalBelt/sendmail-sec` repository.
 - Strict tags are required: `2.1.2`, `1.1.0-beta.1`, or `1.1.0-build.4f43abcd`. `v`-prefixed tags and unsupported prerelease names are rejected.
 - Stable releases publish `latest`, `<major>-alpine-musl`, and per-architecture `<major>-alpine-musl-<arch>` aliases. Beta and build releases publish only versioned tags.
-- Release CI validates the tag, updates Cargo release metadata in the CI worktree, builds per-architecture Docker image tar artifacts, runs Trivy image scans, and only then pushes arch tags and multi-arch manifests.
+- Release CI validates the tag, updates Cargo release metadata in the CI worktree, builds and structurally verifies per-architecture Docker image tar artifacts, runs an isolated QEMU smoke test against the completed `riscv64` image, runs Trivy image scans, and only then pushes arch tags and multi-arch manifests.
 - The Docker workflow publishes Alpine musl images for `linux/amd64`, `linux/arm64`, and `linux/riscv64`.
 
 Run DevOps validation locally after changing release automation:

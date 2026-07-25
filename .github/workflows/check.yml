@@ -14,7 +14,7 @@ env:
 jobs:
   devops:
     name: DevOps checks
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
 
@@ -58,8 +58,8 @@ jobs:
       fail-fast: false
       matrix:
         runner:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
 
     steps:
       - name: Checkout
@@ -92,15 +92,15 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             image_tar: sendmail-sec-alpine-musl-amd64.tar
           - arch: arm64
             platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             image_tar: sendmail-sec-alpine-musl-arm64.tar
           - arch: riscv64
             platform: linux/riscv64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             image_tar: sendmail-sec-alpine-musl-riscv64.tar
 
     steps:
@@ -155,7 +155,7 @@ jobs:
 
   docker-riscv64-smoke:
     name: Docker image runtime smoke (riscv64)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     needs:
       - docker-image

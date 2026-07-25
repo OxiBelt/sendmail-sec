@@ -23,7 +23,7 @@ env:
 jobs:
   validate:
     name: Validate release metadata
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -237,17 +237,17 @@ jobs:
             artifact_name: sendmail-sec-alpine-musl-amd64-image
             image_tar: sendmail-sec-alpine-musl-amd64.tar
             platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - artifact_arch: arm64
             artifact_name: sendmail-sec-alpine-musl-arm64-image
             image_tar: sendmail-sec-alpine-musl-arm64.tar
             platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - artifact_arch: riscv64
             artifact_name: sendmail-sec-alpine-musl-riscv64-image
             image_tar: sendmail-sec-alpine-musl-riscv64.tar
             platform: linux/riscv64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
 
     steps:
       - name: Checkout release ref
@@ -310,7 +310,7 @@ jobs:
 
   docker-riscv64-smoke:
     name: Docker image runtime smoke (riscv64)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     needs:
       - docker-alpine-musl-image
@@ -350,7 +350,7 @@ jobs:
 
   docker-image-trivy-scan:
     name: Docker image Trivy scan (${{ matrix.artifact_arch }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs:
       - docker-alpine-musl-image
     permissions:
@@ -452,7 +452,7 @@ jobs:
 
   ghcr-publish:
     name: Publish GHCR images
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs:
       - validate
       - docker-alpine-musl-image

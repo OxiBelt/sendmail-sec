@@ -44,7 +44,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 image_tag="sendmail-sec:alpine-musl-${artifact_arch}"
 image_tar="${output_dir%/}/sendmail-sec-alpine-musl-${artifact_arch}.tar"
-rust_builder_image="rust:1.94-alpine"
+rust_builder_image="rust:1.97-alpine3.24"
 sendmail_sec_version="$(
   sed -n 's/^version = "\(.*\)"/\1/p' "${repo_root}/Cargo.toml" | head -n 1
 )"
@@ -72,7 +72,7 @@ case "${artifact_arch}" in
       usage
       exit 2
     }
-    rust_builder_image="rust:1.94-trixie"
+    rust_builder_image="rust:1.97-trixie"
     ;;
   *)
     usage

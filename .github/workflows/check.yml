@@ -14,18 +14,23 @@ env:
 jobs:
   devops:
     name: DevOps checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
 
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.10.0 --activate
+          pnpm --version
 
       - name: Install Node dependencies
         run: pnpm install --frozen-lockfile
@@ -51,17 +56,17 @@ jobs:
       fail-fast: false
       matrix:
         runner:
-          - ubuntu-latest
+          - ubuntu-24.04
           - ubuntu-24.04-arm
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up cargo
+      - name: Set up Cargo
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-          rustup default stable
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Cargo fmt
         run: cargo fmt --all --check
@@ -83,7 +88,7 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             qemu_platforms: ""
             image_tar: sendmail-sec-alpine-musl-amd64.tar
           - arch: arm64
@@ -93,13 +98,13 @@ jobs:
             image_tar: sendmail-sec-alpine-musl-arm64.tar
           - arch: riscv64
             platform: linux/riscv64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             qemu_platforms: riscv64
             image_tar: sendmail-sec-alpine-musl-riscv64.tar
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
         if: matrix.qemu_platforms != ''
@@ -108,10 +113,12 @@ jobs:
           platforms: ${{ matrix.qemu_platforms }}
 
       - name: Pre-pull Docker BuildKit image
-        run: scripts/retry-docker-pull.sh moby/buildkit:buildx-stable-1
+        run: scripts/retry-docker-pull.sh moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
 
       - name: Build Docker image artifact
         run: |
@@ -126,12 +133,15 @@ jobs:
       # The riscv64 image is executed through QEMU on GitHub's amd64 runner.
       # Native amd64/arm64 jobs cover TLS relay behavior; riscv64 gets a
       # container startup smoke test below.
-      - name: Run Docker integration test
+      - name: Run Docker integration tests
         if: matrix.arch != 'riscv64'
         env:
           APP_IMAGE: sendmail-sec:alpine-musl-${{ matrix.arch }}
-          APP_IMAGE_CLEANUP: "1"
-        run: scripts/docker-integration-test.sh
+        run: |
+          set -Eeuo pipefail
+          trap 'docker image rm -f "${APP_IMAGE}" >/dev/null 2>&1 || true' EXIT
+          REMOTE_TLS_MODE=wrapper scripts/docker-integration-test.sh
+          REMOTE_TLS_MODE=starttls scripts/docker-integration-test.sh
 
       - name: Run Docker smoke test
         if: matrix.arch == 'riscv64'

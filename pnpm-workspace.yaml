@@ -2,5 +2,4 @@ packages:
   - "devops"
 allowBuilds:
   esbuild: true
-minimumReleaseAgeExclude:
-  - tsx@4.22.5
+minimumReleaseAge: 1440

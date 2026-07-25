@@ -32,9 +32,9 @@ impl AppConfig {
     {
       Some("json") => serde_json::from_slice::<Self>(&raw)
         .with_context(|| format!("failed to parse JSON config {}", path.display()))?,
-      Some("yaml") | Some("yml") => serde_yaml::from_slice::<Self>(&raw)
+      Some("yaml") | Some("yml") => serde_norway::from_slice::<Self>(&raw)
         .with_context(|| format!("failed to parse YAML config {}", path.display()))?,
-      _ => serde_yaml::from_slice::<Self>(&raw)
+      _ => serde_norway::from_slice::<Self>(&raw)
         .or_else(|_| serde_json::from_slice::<Self>(&raw))
         .with_context(|| {
           format!(
@@ -337,4 +337,164 @@ fn default_allowed_networks() -> Vec<IpNet> {
   .into_iter()
   .map(|cidr| cidr.parse().expect("default CIDR must be valid"))
   .collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{
+    fs,
+    path::{Path, PathBuf},
+  };
+
+  use super::*;
+
+  const MINIMAL_YAML: &str = r#"
+listen:
+  auth:
+    username: inbound
+    password: secret
+remote_smtp:
+  host: smtp.example.com
+  auth:
+    mechanism: PLAIN
+    username: relay
+    password: secret
+"#;
+
+  const MINIMAL_JSON: &str = r#"{
+  "listen": {
+    "auth": {
+      "username": "inbound",
+      "password": "secret"
+    }
+  },
+  "remote_smtp": {
+    "host": "smtp.example.com",
+    "auth": {
+      "mechanism": "PLAIN",
+      "username": "relay",
+      "password": "secret"
+    }
+  }
+}"#;
+
+  struct TestConfigFile {
+    path: PathBuf,
+  }
+
+  impl TestConfigFile {
+    fn new(extension: Option<&str>, contents: &str) -> Self {
+      let mut path = std::env::temp_dir().join(format!("sendmail-sec-{}", uuid::Uuid::new_v4()));
+      if let Some(extension) = extension {
+        path.set_extension(extension);
+      }
+      fs::write(&path, contents).unwrap();
+      Self { path }
+    }
+
+    fn path(&self) -> &Path {
+      &self.path
+    }
+  }
+
+  impl Drop for TestConfigFile {
+    fn drop(&mut self) {
+      let _ = fs::remove_file(&self.path);
+    }
+  }
+
+  #[test]
+  fn loads_yaml_extensions_with_defaults_and_enum_aliases() {
+    for extension in ["yaml", "yml"] {
+      let file = TestConfigFile::new(Some(extension), MINIMAL_YAML);
+      let config = AppConfig::load(file.path()).unwrap();
+
+      assert_eq!(config.listen.bind, "0.0.0.0:2525".parse().unwrap());
+      assert_eq!(config.remote_smtp.port, 587);
+      assert!(matches!(
+        config.remote_smtp.auth,
+        RemoteAuthConfig::Plain { .. }
+      ));
+    }
+  }
+
+  #[test]
+  fn loads_yaml_anchor_aliases() {
+    let file = TestConfigFile::new(
+      Some("yaml"),
+      r#"
+relay_auth: &relay_auth
+  mechanism: plain
+  username: relay
+  password: secret
+listen:
+  auth:
+    username: inbound
+    password: secret
+remote_smtp:
+  host: smtp.example.com
+  auth: *relay_auth
+"#,
+    );
+
+    let config = AppConfig::load(file.path()).unwrap();
+    assert!(matches!(
+      config.remote_smtp.auth,
+      RemoteAuthConfig::Plain { .. }
+    ));
+  }
+
+  #[test]
+  fn extensionless_files_fall_back_between_yaml_and_json() {
+    for contents in [MINIMAL_YAML, MINIMAL_JSON] {
+      let file = TestConfigFile::new(None, contents);
+      let config = AppConfig::load(file.path()).unwrap();
+      assert_eq!(config.remote_smtp.host, "smtp.example.com");
+    }
+  }
+
+  #[test]
+  fn resolves_relative_paths_against_the_config_directory() {
+    let contents = format!(
+      "{MINIMAL_YAML}\ntls:\n  extra_root_certificates:\n    - roots/ca.pem\nopenpgp:\n  local_key_files:\n    - keys/public.asc\n  local_key_directories:\n    - keys\n"
+    );
+    let file = TestConfigFile::new(Some("yaml"), &contents);
+    let base = file.path().parent().unwrap();
+    let config = AppConfig::load(file.path()).unwrap();
+
+    assert_eq!(
+      config.tls.extra_root_certificates,
+      [base.join("roots/ca.pem")]
+    );
+    assert_eq!(
+      config.openpgp.local_key_files,
+      [base.join("keys/public.asc")]
+    );
+    assert_eq!(config.openpgp.local_key_directories, [base.join("keys")]);
+  }
+
+  #[test]
+  fn rejects_malformed_yaml() {
+    let file = TestConfigFile::new(Some("yaml"), "listen: [");
+    let error = AppConfig::load(file.path()).unwrap_err();
+    assert!(error.to_string().contains("failed to parse YAML config"));
+  }
+
+  #[test]
+  fn rejects_recursive_yaml_aliases() {
+    let file = TestConfigFile::new(
+      Some("yaml"),
+      r#"
+listen:
+  auth:
+    username: inbound
+    password: secret
+remote_smtp: &remote
+  host: smtp.example.com
+  auth: *remote
+"#,
+    );
+
+    assert!(AppConfig::load(file.path()).is_err());
+  }
 }

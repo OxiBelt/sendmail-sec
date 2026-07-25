@@ -130,7 +130,13 @@ Run the Docker integration test:
 scripts/docker-integration-test.sh
 ```
 
-The integration test builds a temporary image, generates temporary OpenPGP and TLS material, copies test files into containers with `docker cp`, verifies encrypted SMTP relay through a TLS fixture, and removes the containers, network, image tag, and temporary files before exiting.
+Wrapper TLS is the default. Exercise the explicit STARTTLS path with:
+
+```bash
+REMOTE_TLS_MODE=starttls scripts/docker-integration-test.sh
+```
+
+The integration test builds a temporary image, generates temporary OpenPGP and TLS material, copies test files into containers with `docker cp`, verifies encrypted SMTP relay through either wrapper TLS or STARTTLS, and removes the containers, network, image tag, and temporary files before exiting.
 
 ## Notes
 

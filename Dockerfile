@@ -1,7 +1,7 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.25.0@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
 
-ARG RUST_BUILDER_IMAGE=rust:1.94-alpine
-ARG ALPINE_VERSION=3.22
+ARG RUST_BUILDER_IMAGE=rust:1.97-alpine3.24
+ARG ALPINE_IMAGE=alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 ARG SENDMAIL_SEC_VERSION=dev
 ARG SENDMAIL_SEC_REVISION=unknown
 ARG SENDMAIL_SEC_CREATED=1970-01-01T00:00:00Z
@@ -58,7 +58,7 @@ RUN RUST_TARGET="$(cat /tmp/rust-target)" && \
     cargo build --locked --release --target "${RUST_TARGET}" && \
     install -Dm755 "target/${RUST_TARGET}/release/sendmail-sec" /out/sendmail-sec
 
-FROM --platform=$TARGETPLATFORM alpine:${ALPINE_VERSION}
+FROM --platform=$TARGETPLATFORM ${ALPINE_IMAGE}
 
 ARG SENDMAIL_SEC_VERSION
 ARG SENDMAIL_SEC_REVISION

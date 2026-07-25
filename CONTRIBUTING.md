@@ -36,6 +36,14 @@ committed.
 | `.github/workflows/` | GitHub Actions workflows. | CI checks, release image publishing, build matrix, or required workflow behavior changes. |
 | `README.md` | User-facing overview, build, configuration, container, and release notes. | Setup, usage, high-level behavior, configuration, or release documentation changes. |
 
+## Contributor Prerequisites
+
+- Rust `1.97.x`; `rustup` honors the repository `rust-toolchain.toml`.
+- Node.js `24` LTS at the version recorded in `.node-version`.
+- pnpm `11.17.x`, activated through Corepack from the `packageManager` field in
+  `package.json`.
+- Docker Engine with Buildx for container and integration checks.
+
 ## Contribution Workflow
 
 1. Identify the affected area before editing: Rust runtime, inbound SMTP,

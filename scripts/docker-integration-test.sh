@@ -5,12 +5,13 @@ APP_IMAGE_PREFIX="${APP_IMAGE_PREFIX:-sendmail-sec}"
 APP_IMAGE="${APP_IMAGE:-}"
 APP_IMAGE_CLEANUP="${APP_IMAGE_CLEANUP:-0}"
 DOCKER_BUILD_PLATFORM="${DOCKER_BUILD_PLATFORM:-}"
-HELPER_IMAGE="${HELPER_IMAGE:-python:3.12-alpine}"
+HELPER_IMAGE="${HELPER_IMAGE:-python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92}"
 PGP_EMAIL="${PGP_EMAIL:-recipient@example.test}"
 INBOUND_USERNAME="${INBOUND_USERNAME:-inbound-relay}"
 INBOUND_PASSWORD="${INBOUND_PASSWORD:-change-me}"
 REMOTE_USERNAME="${REMOTE_USERNAME:-relay-user}"
 REMOTE_PASSWORD="${REMOTE_PASSWORD:-relay-password}"
+REMOTE_TLS_MODE="${REMOTE_TLS_MODE:-wrapper}"
 SMTP_HOST="smtp-fixture"
 SMTP_PORT="8465"
 
@@ -120,6 +121,11 @@ require_command sed
 
 docker info >/dev/null 2>&1 || die "Docker is not available to this shell"
 
+case "$REMOTE_TLS_MODE" in
+  wrapper | starttls) ;;
+  *) die "REMOTE_TLS_MODE must be wrapper or starttls, got: $REMOTE_TLS_MODE" ;;
+esac
+
 run_id="$(date +%Y%m%d%H%M%S)-$$-$(openssl rand -hex 4)"
 if [ -n "$APP_IMAGE" ]; then
   app_image="$APP_IMAGE"
@@ -218,7 +224,7 @@ listen:
 remote_smtp:
   host: ${SMTP_HOST}
   port: ${SMTP_PORT}
-  tls_mode: wrapper
+  tls_mode: ${REMOTE_TLS_MODE}
   hello_name: relay.local
   auth:
     mechanism: plain
@@ -260,6 +266,7 @@ key_path = "/tmp/server.key"
 capture_path = "/tmp/captured.eml"
 expected_user = os.environ["REMOTE_USERNAME"]
 expected_password = os.environ["REMOTE_PASSWORD"]
+tls_mode = os.environ["REMOTE_TLS_MODE"]
 
 
 def send(file, line):
@@ -296,9 +303,15 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
     server.listen(1)
-    print("SMTP fixture ready", flush=True)
+    print(f"SMTP fixture ready ({tls_mode})", flush=True)
 
-    with context.wrap_socket(server.accept()[0], server_side=True) as conn:
+    conn, _ = server.accept()
+    file = None
+    try:
+        tls_active = tls_mode == "wrapper"
+        authenticated = False
+        if tls_active:
+            conn = context.wrap_socket(conn, server_side=True)
         file = conn.makefile("rwb", buffering=0)
         send(file, "220 smtp-fixture ESMTP ready")
 
@@ -308,9 +321,24 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
 
             if upper.startswith("EHLO ") or upper.startswith("HELO "):
                 send(file, "250-smtp-fixture")
-                send(file, "250-AUTH PLAIN")
+                if tls_active:
+                    send(file, "250-AUTH PLAIN")
+                else:
+                    send(file, "250-STARTTLS")
                 send(file, "250 SIZE 1048576")
+            elif upper == "STARTTLS":
+                if tls_active or tls_mode != "starttls":
+                    send(file, "454 TLS not available")
+                    continue
+                send(file, "220 ready to start TLS")
+                file.close()
+                conn = context.wrap_socket(conn, server_side=True)
+                file = conn.makefile("rwb", buffering=0)
+                tls_active = True
             elif upper == "AUTH PLAIN":
+                if not tls_active:
+                    send(file, "530 must issue STARTTLS first")
+                    continue
                 send(file, "334 ")
                 payload = base64.b64decode(read_line(file)).decode("utf-8", errors="replace")
                 parts = payload.split("\x00")
@@ -319,12 +347,22 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
                 if username != expected_user or password != expected_password:
                     send(file, "535 authentication failed")
                     sys.exit(2)
+                authenticated = True
                 send(file, "235 authentication successful")
             elif upper.startswith("MAIL FROM:"):
+                if not tls_active or not authenticated:
+                    send(file, "530 authentication over TLS required")
+                    continue
                 send(file, "250 sender ok")
             elif upper.startswith("RCPT TO:"):
+                if not tls_active or not authenticated:
+                    send(file, "530 authentication over TLS required")
+                    continue
                 send(file, "250 recipient ok")
             elif upper == "DATA":
+                if not tls_active or not authenticated:
+                    send(file, "530 authentication over TLS required")
+                    continue
                 send(file, "354 end data with <CRLF>.<CRLF>")
                 data = read_data(file)
                 with open(capture_path, "wb") as output:
@@ -338,6 +376,10 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
                 break
             else:
                 send(file, "502 command not implemented")
+    finally:
+        if file is not None:
+            file.close()
+        conn.close()
 PY
 
 marker="sendmail-sec integration marker ${run_id}"
@@ -416,7 +458,7 @@ fi
 log "creating isolated Docker network ${network}"
 docker network create "$network" >/dev/null
 
-log "starting TLS SMTP fixture"
+log "starting ${REMOTE_TLS_MODE} TLS SMTP fixture"
 docker create \
   --name "$smtp_container" \
   --network "$network" \
@@ -424,6 +466,7 @@ docker create \
   --env "SMTP_PORT=${SMTP_PORT}" \
   --env "REMOTE_USERNAME=${REMOTE_USERNAME}" \
   --env "REMOTE_PASSWORD=${REMOTE_PASSWORD}" \
+  --env "REMOTE_TLS_MODE=${REMOTE_TLS_MODE}" \
   "$HELPER_IMAGE" \
   python /tmp/smtp_server.py >/dev/null
 docker cp "${tmpdir}/smtp_server.py" "${smtp_container}:/tmp/smtp_server.py"

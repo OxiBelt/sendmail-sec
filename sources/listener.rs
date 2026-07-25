@@ -476,10 +476,37 @@ mod tests {
 
   #[test]
   fn parses_auth_plain_payload() {
-    let payload: String = STANDARD.encode(b"\0relay\0secret");
-    let (username, password) = decode_auth_plain(&payload).unwrap();
+    let (username, password) = decode_auth_plain("AHJlbGF5AHNlY3JldA==").unwrap();
     assert_eq!(username, "relay");
     assert_eq!(password, "secret");
+  }
+
+  #[test]
+  fn rejects_invalid_base64_auth_plain_payload() {
+    let error = decode_auth_plain("not-base64!").unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("invalid base64 payload for AUTH PLAIN")
+    );
+  }
+
+  #[test]
+  fn rejects_malformed_auth_plain_payload() {
+    let payload = STANDARD.encode(b"relay:secret");
+    let error = decode_auth_plain(&payload).unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("AUTH PLAIN payload is malformed")
+    );
+  }
+
+  #[test]
+  fn rejects_non_utf8_auth_plain_credentials() {
+    let payload = STANDARD.encode(b"\0relay\0\xff");
+    let error = decode_auth_plain(&payload).unwrap_err();
+    assert!(error.to_string().contains("AUTH password is not UTF-8"));
   }
 
   #[test]

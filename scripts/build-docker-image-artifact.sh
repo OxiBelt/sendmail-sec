@@ -6,7 +6,7 @@ usage() {
   echo "artifact-arch: amd64, arm64, or riscv64" >&2
 }
 
-default_source="https://github.com/digitalBelt/sendmail-sec"
+default_source="https://github.com/OxiBelt/sendmail-sec"
 
 sanitize_source_url() {
   local source_url="$1"

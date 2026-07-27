@@ -17,8 +17,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
-  SENDMAIL_SEC_GHCR_IMAGE: ghcr.io/digitalbelt/sendmail-sec
-  SENDMAIL_SEC_SOURCE_URL: https://github.com/digitalBelt/sendmail-sec
+  SENDMAIL_SEC_CANONICAL_REPOSITORY: OxiBelt/sendmail-sec
+  SENDMAIL_SEC_CANONICAL_REPOSITORY_ID: "996727148"
+  SENDMAIL_SEC_GHCR_IMAGE: ghcr.io/oxibelt/sendmail-sec
+  SENDMAIL_SEC_SOURCE_URL: https://github.com/OxiBelt/sendmail-sec
 
 jobs:
   validate:
@@ -33,6 +35,31 @@ jobs:
       version: ${{ steps.image-plan.outputs.version }}
 
     steps:
+      - name: Validate publisher repository identity
+        env:
+          CURRENT_REPOSITORY: ${{ github.repository }}
+          CURRENT_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+
+          name_matches=false
+          id_matches=false
+          if [[ "${CURRENT_REPOSITORY}" == "${SENDMAIL_SEC_CANONICAL_REPOSITORY}" ]]; then
+            name_matches=true
+          fi
+          if [[ "${CURRENT_REPOSITORY_ID}" == "${SENDMAIL_SEC_CANONICAL_REPOSITORY_ID}" ]]; then
+            id_matches=true
+          fi
+
+          if [[ "${name_matches}" != "${id_matches}" ]]; then
+            echo "::error::canonical publisher identity mismatch: repository=${CURRENT_REPOSITORY} id=${CURRENT_REPOSITORY_ID}; expected repository=${SENDMAIL_SEC_CANONICAL_REPOSITORY} id=${SENDMAIL_SEC_CANONICAL_REPOSITORY_ID}"
+            exit 1
+          fi
+
+          if [[ "${name_matches}" == false ]]; then
+            echo "::notice::non-canonical repository ${CURRENT_REPOSITORY} (${CURRENT_REPOSITORY_ID}); release artifacts will be built but GHCR publishing will be skipped"
+          fi
+
       - name: Checkout release ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -458,7 +485,7 @@ jobs:
       - docker-alpine-musl-image
       - docker-riscv64-smoke
       - docker-image-trivy-scan
-    if: github.repository == 'digitalBelt/sendmail-sec'
+    if: github.repository == 'OxiBelt/sendmail-sec' && github.repository_id == '996727148'
     permissions:
       actions: read
       contents: read

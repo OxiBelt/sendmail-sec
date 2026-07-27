@@ -3,8 +3,8 @@ import * as Process from 'node:process'
 import { pathToFileURL } from 'node:url'
 import * as Semver from 'semver'
 
-export const GhcrImage = 'ghcr.io/digitalbelt/sendmail-sec'
-export const SourceUrl = 'https://github.com/digitalBelt/sendmail-sec'
+export const GhcrImage = 'ghcr.io/oxibelt/sendmail-sec'
+export const SourceUrl = 'https://github.com/OxiBelt/sendmail-sec'
 
 export type ReleaseKind = 'stable' | 'beta' | 'build'
 

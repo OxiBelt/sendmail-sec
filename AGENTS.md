@@ -100,8 +100,8 @@ reason.
 Docker release automation uses TypeScript tooling under `devops/` to validate
 strict release tags, update Cargo release metadata during CI, and emit the
 image plan consumed by `.github/workflows/release-docker.yml`. Release images
-publish to `ghcr.io/digitalbelt/sendmail-sec` only from the canonical
-`digitalBelt/sendmail-sec` repository.
+publish to `ghcr.io/oxibelt/sendmail-sec` only from the canonical
+`OxiBelt/sendmail-sec` repository.
 
 ## Editing Notes
 

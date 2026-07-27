@@ -155,7 +155,7 @@ The integration test builds a temporary image, generates temporary OpenPGP and T
 
 ## Release Automation
 
-- Docker releases publish to `ghcr.io/digitalbelt/sendmail-sec` from the canonical `digitalBelt/sendmail-sec` repository.
+- Docker releases publish to `ghcr.io/oxibelt/sendmail-sec` from the canonical `OxiBelt/sendmail-sec` repository.
 - Strict tags are required: `2.1.2`, `1.1.0-beta.1`, or `1.1.0-build.4f43abcd`. `v`-prefixed tags and unsupported prerelease names are rejected.
 - Stable releases publish `latest`, `<major>-alpine-musl`, and per-architecture `<major>-alpine-musl-<arch>` aliases. Beta and build releases publish only versioned tags.
 - Release CI validates the tag, updates Cargo release metadata in the CI worktree, builds and structurally verifies per-architecture Docker image tar artifacts, runs an isolated QEMU smoke test against the completed `riscv64` image, runs Trivy image scans, and only then pushes arch tags and multi-arch manifests.

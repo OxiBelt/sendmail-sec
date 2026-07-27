@@ -7,8 +7,10 @@ import {
   AssertBuildTagMatchesRevision,
   AssertReleaseEventAllowed,
   BuildImageReleasePlan,
+  GhcrImage,
   ParseReleaseRef,
-  ParseReleaseTag
+  ParseReleaseTag,
+  SourceUrl
 } from '../sources/docker_image_release.js'
 import { RunVersioning } from '../sources/versioning.js'
 
@@ -25,6 +27,7 @@ type ReleasePlanSummary = {
   image: string
   tag: string
   kind: string
+  source: string
 }
 /* eslint-enable @typescript-eslint/naming-convention */
 
@@ -218,25 +221,26 @@ test('release mode rewrites Cargo versions and emits the image plan', TestContex
   })
   Assert.match(Manifest, /^version = "1\.5\.0-beta\.1"$/m)
   Assert.match(Lockfile, /^version = "1\.5\.0-beta\.1"$/m)
-  Assert.equal(Plan.image, 'ghcr.io/digitalbelt/sendmail-sec')
+  Assert.equal(Plan.image, 'ghcr.io/oxibelt/sendmail-sec')
   Assert.equal(Plan.tag, '1.5.0-beta.1')
   Assert.equal(Plan.kind, 'beta')
+  Assert.equal(Plan.source, 'https://github.com/OxiBelt/sendmail-sec')
 })
 
 test('stable image plan includes major aliases and stable manifest tags', () => {
   const Plan = BuildImageReleasePlan({
     releaseTag: ParseReleaseTag('5.2.0'),
     revision: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    source: 'https://github.com/digitalBelt/sendmail-sec'
+    source: 'https://github.com/OxiBelt/sendmail-sec'
   })
   const Amd64 = Plan.artifacts.find(Artifact => Artifact.artifactArch === 'amd64')
 
   if (Amd64 === undefined) {
     throw new Error('stable image plan should include the amd64 artifact')
   }
-  Assert.ok(Amd64.ghcrTags.includes('ghcr.io/digitalbelt/sendmail-sec:5-alpine-musl-amd64'))
-  Assert.ok(Plan.manifests[0].ghcrTags.includes('ghcr.io/digitalbelt/sendmail-sec:latest'))
-  Assert.ok(Plan.manifests[1].ghcrTags.includes('ghcr.io/digitalbelt/sendmail-sec:5-alpine-musl'))
+  Assert.ok(Amd64.ghcrTags.includes('ghcr.io/oxibelt/sendmail-sec:5-alpine-musl-amd64'))
+  Assert.ok(Plan.manifests[0].ghcrTags.includes('ghcr.io/oxibelt/sendmail-sec:latest'))
+  Assert.ok(Plan.manifests[1].ghcrTags.includes('ghcr.io/oxibelt/sendmail-sec:5-alpine-musl'))
 })
 
 test('beta and build image plans do not include latest or major aliases', () => {
@@ -244,11 +248,27 @@ test('beta and build image plans do not include latest or major aliases', () => 
     const Plan = BuildImageReleasePlan({
       releaseTag: ParseReleaseTag(Tag),
       revision: '4f43abcd99999999999999999999999999999999',
-      source: 'https://github.com/digitalBelt/sendmail-sec'
+      source: 'https://github.com/OxiBelt/sendmail-sec'
     })
     const Serialized = JSON.stringify(Plan)
 
     Assert.equal(Serialized.includes(':latest'), false)
     Assert.equal(Serialized.includes(':5-alpine-musl'), false)
+  }
+})
+
+test('release plans use only the current organization identity', () => {
+  Assert.equal(GhcrImage, 'ghcr.io/oxibelt/sendmail-sec')
+  Assert.equal(SourceUrl, 'https://github.com/OxiBelt/sendmail-sec')
+
+  for (const Tag of ['5.2.0', '5.2.0-beta.1', '5.2.0-build.4f43abcd']) {
+    const Plan = BuildImageReleasePlan({
+      releaseTag: ParseReleaseTag(Tag),
+      revision: '4f43abcd99999999999999999999999999999999',
+      source: SourceUrl
+    })
+
+    Assert.equal(Plan.image, GhcrImage)
+    Assert.equal(Plan.source, SourceUrl)
   }
 })

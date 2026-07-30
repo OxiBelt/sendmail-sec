@@ -283,7 +283,13 @@ impl SmtpListener {
 
     match decode_auth_plain(&response) {
       Ok((username, password)) => {
-        if username == self.listen.auth.username && password == self.listen.auth.password {
+        let expected_password = self
+          .listen
+          .auth
+          .password
+          .expose()
+          .context("inbound authentication secret was not resolved")?;
+        if username == self.listen.auth.username && password == expected_password {
           state.authenticated = true;
           self
             .write_response(reader, 235, "authentication successful")

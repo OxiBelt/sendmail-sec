@@ -1,0 +1,30 @@
+name: sendmail-sec
+
+services:
+  sendmail-sec:
+    image: ghcr.io/oxibelt/sendmail-sec:latest
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - 127.0.0.1:2525:2525
+    configs:
+      - source: sendmail_sec_config
+        target: /config/sendmail-sec.yaml
+    secrets:
+      - listen_auth_password
+      - remote_smtp_password
+
+configs:
+  sendmail_sec_config:
+    file: ./config-secrets.yaml
+
+secrets:
+  listen_auth_password:
+    file: ${SENDMAIL_SEC_LISTEN_PASSWORD_FILE:?set SENDMAIL_SEC_LISTEN_PASSWORD_FILE}
+  remote_smtp_password:
+    file: ${SENDMAIL_SEC_REMOTE_PASSWORD_FILE:?set SENDMAIL_SEC_REMOTE_PASSWORD_FILE}

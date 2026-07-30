@@ -101,12 +101,20 @@ impl RemoteSmtpClient {
     match &self.config.auth {
       RemoteAuthConfig::Plain { username, password } => {
         capabilities.require_mechanism("PLAIN")?;
-        connection.command_expect("AUTH PLAIN", &[334]).await?;
+        connection
+          .command_sensitive_expect(
+            "AUTH PLAIN",
+            "remote SMTP AUTH PLAIN initialization",
+            &[334],
+          )
+          .await?;
+        let password = password
+          .expose()
+          .context("remote SMTP PLAIN secret was not resolved")?;
         let payload = STANDARD.encode(format!("\u{0}{username}\u{0}{password}"));
         connection
-          .command_expect(&payload, &[235])
-          .await
-          .context("remote SMTP AUTH PLAIN failed")?;
+          .command_sensitive_expect(&payload, "remote SMTP AUTH PLAIN", &[235])
+          .await?;
       }
       RemoteAuthConfig::Oauthbearer {
         username,
@@ -115,8 +123,15 @@ impl RemoteSmtpClient {
       } => {
         capabilities.require_mechanism("OAUTHBEARER")?;
         connection
-          .command_expect("AUTH OAUTHBEARER", &[334])
+          .command_sensitive_expect(
+            "AUTH OAUTHBEARER",
+            "remote SMTP AUTH OAUTHBEARER initialization",
+            &[334],
+          )
           .await?;
+        let access_token = access_token
+          .expose()
+          .context("remote SMTP OAUTHBEARER secret was not resolved")?;
         let payload = STANDARD.encode(format!(
           "n,a={},\u{1}host={}\u{1}port={}\u{1}auth=Bearer {}\u{1}\u{1}",
           authzid.as_deref().unwrap_or(username),
@@ -124,7 +139,9 @@ impl RemoteSmtpClient {
           self.config.port,
           access_token
         ));
-        let response = connection.command(&payload).await?;
+        let response = connection
+          .command_sensitive_expect(&payload, "remote SMTP AUTH OAUTHBEARER", &[235, 334])
+          .await?;
         if response.code == 235 {
           return Ok(());
         }
@@ -132,8 +149,8 @@ impl RemoteSmtpClient {
           let _ = connection.command("AQ==").await;
         }
         bail!(
-          "remote SMTP AUTH OAUTHBEARER failed: {}",
-          response.summary()
+          "remote SMTP AUTH OAUTHBEARER failed with SMTP status {}",
+          response.code
         );
       }
       RemoteAuthConfig::Xoauth2 {
@@ -141,18 +158,32 @@ impl RemoteSmtpClient {
         access_token,
       } => {
         capabilities.require_mechanism("XOAUTH2")?;
-        connection.command_expect("AUTH XOAUTH2", &[334]).await?;
+        connection
+          .command_sensitive_expect(
+            "AUTH XOAUTH2",
+            "remote SMTP AUTH XOAUTH2 initialization",
+            &[334],
+          )
+          .await?;
+        let access_token = access_token
+          .expose()
+          .context("remote SMTP XOAUTH2 secret was not resolved")?;
         let payload = STANDARD.encode(format!(
           "user={username}\u{1}auth=Bearer {access_token}\u{1}\u{1}"
         ));
-        let response = connection.command(&payload).await?;
+        let response = connection
+          .command_sensitive_expect(&payload, "remote SMTP AUTH XOAUTH2", &[235, 334])
+          .await?;
         if response.code == 235 {
           return Ok(());
         }
         if response.code == 334 {
           let _ = connection.command("").await;
         }
-        bail!("remote SMTP AUTH XOAUTH2 failed: {}", response.summary());
+        bail!(
+          "remote SMTP AUTH XOAUTH2 failed with SMTP status {}",
+          response.code
+        );
       }
     }
 
@@ -174,18 +205,28 @@ impl RemoteSmtpClient {
     };
 
     connection
-      .command_expect(&format!("MAIL FROM:{sender}"), &[250])
+      .command_sensitive_expect(
+        &format!("MAIL FROM:{sender}"),
+        "remote SMTP MAIL FROM",
+        &[250],
+      )
       .await
       .context("remote SMTP MAIL FROM rejected")?;
 
     for recipient in &message.envelope.rcpt_to {
       connection
-        .command_expect(&format!("RCPT TO:<{recipient}>"), &[250, 251])
+        .command_sensitive_expect(
+          &format!("RCPT TO:<{recipient}>"),
+          "remote SMTP RCPT TO",
+          &[250, 251],
+        )
         .await
         .with_context(|| format!("remote SMTP RCPT TO rejected for {recipient}"))?;
     }
 
-    connection.command_expect("DATA", &[354]).await?;
+    connection
+      .command_sensitive_expect("DATA", "remote SMTP DATA", &[354])
+      .await?;
     connection
       .write_message_data(&message.data)
       .await
@@ -273,7 +314,9 @@ where
     self.write_all(&stuffed).await?;
     self.write_all(b".\r\n").await?;
     self.flush().await?;
-    self.expect_response(&[250]).await?;
+    self
+      .expect_response_sensitive("remote SMTP message data", &[250])
+      .await?;
     Ok(())
   }
 
@@ -292,6 +335,24 @@ where
       expected_codes,
       response.code,
       response.summary()
+    )
+  }
+
+  async fn command_sensitive_expect(
+    &mut self,
+    line: &str,
+    operation: &'static str,
+    expected_codes: &[u16],
+  ) -> anyhow::Result<SmtpResponse> {
+    let response = self.command(line).await?;
+    if expected_codes.contains(&response.code) {
+      return Ok(response);
+    }
+
+    bail!(
+      "{operation} failed: expected SMTP status {:?}, got {}",
+      expected_codes,
+      response.code
     )
   }
 
@@ -316,6 +377,23 @@ where
     )
   }
 
+  async fn expect_response_sensitive(
+    &mut self,
+    operation: &'static str,
+    expected_codes: &[u16],
+  ) -> anyhow::Result<SmtpResponse> {
+    let response = self.read_response().await?;
+    if expected_codes.contains(&response.code) {
+      return Ok(response);
+    }
+
+    bail!(
+      "{operation} failed: expected SMTP status {:?}, got {}",
+      expected_codes,
+      response.code
+    )
+  }
+
   async fn read_response(&mut self) -> anyhow::Result<SmtpResponse> {
     let mut code = None;
     let mut lines = Vec::new();
@@ -326,11 +404,22 @@ where
         bail!("short SMTP response from remote server");
       }
 
-      let parsed_code: u16 = line[..3]
+      let bytes = line.as_bytes();
+      let code_bytes = &bytes[..3];
+      if !code_bytes.iter().all(u8::is_ascii_digit) {
+        bail!("invalid SMTP response code");
+      }
+      let parsed_code: u16 = std::str::from_utf8(code_bytes)
+        .context("invalid SMTP response code")?
         .parse()
-        .with_context(|| format!("invalid SMTP response code in `{line}`"))?;
-      let separator = line.as_bytes().get(3).copied().unwrap_or(b' ');
-      let text = line.get(4..).unwrap_or("").trim().to_string();
+        .context("invalid SMTP response code")?;
+      let separator = bytes.get(3).copied().unwrap_or(b' ');
+      let text = bytes
+        .get(4..)
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
       if let Some(existing) = code {
         if existing != parsed_code {
@@ -447,6 +536,80 @@ mod tests {
     let stream = connection.into_inner();
     assert_eq!(stream.written, b"QUIT\r\n");
     assert!(stream.shutdown);
+  }
+
+  #[tokio::test]
+  async fn sensitive_command_errors_hide_payloads_and_response_text() {
+    for (operation, payload) in [
+      ("remote SMTP AUTH PLAIN", "AHJlbGF5AHNlbnRpbmVsLXNlY3JldA=="),
+      (
+        "remote SMTP AUTH OAUTHBEARER",
+        "bixhPXJlbGF5LAFhdXRoPUJlYXJlciBzZW50aW5lbC1zZWNyZXQBAQ==",
+      ),
+      (
+        "remote SMTP AUTH XOAUTH2",
+        "dXNlcj1yZWxheQFhdXRoPUJlYXJlciBzZW50aW5lbC1zZWNyZXQBAQ==",
+      ),
+    ] {
+      let stream = FlushGateStream::new(b"535 sentinel-secret echoed\r\n");
+      let mut connection = SmtpConnection::new(stream, Duration::from_secs(1));
+
+      let error = connection
+        .command_sensitive_expect(payload, operation, &[235])
+        .await
+        .unwrap_err();
+      let rendered = format!("{error:#}");
+
+      assert!(rendered.contains(operation));
+      assert!(!rendered.contains(payload));
+      assert!(!rendered.contains("sentinel-secret"));
+      assert!(!rendered.contains("echoed"));
+    }
+  }
+
+  #[tokio::test]
+  async fn malformed_sensitive_responses_hide_raw_lines() {
+    let stream = FlushGateStream::new(b"sentinel-secret\r\n");
+    let mut connection = SmtpConnection::new(stream, Duration::from_secs(1));
+
+    let error = connection
+      .command_sensitive_expect(
+        "AHJlbGF5AHNlbnRpbmVsLXNlY3JldA==",
+        "remote SMTP AUTH PLAIN",
+        &[235],
+      )
+      .await
+      .unwrap_err();
+    let rendered = format!("{error:#}");
+
+    assert!(rendered.contains("invalid SMTP response code"));
+    assert!(!rendered.contains("sentinel-secret"));
+  }
+
+  #[tokio::test]
+  async fn non_ascii_response_codes_return_errors_instead_of_panicking() {
+    let stream = FlushGateStream::new("💥\r\n".as_bytes());
+    let mut connection = SmtpConnection::new(stream, Duration::from_secs(1));
+
+    let error = connection.command("NOOP").await.unwrap_err();
+
+    assert!(format!("{error:#}").contains("invalid SMTP response code"));
+  }
+
+  #[tokio::test]
+  async fn message_data_errors_hide_post_auth_response_text() {
+    let stream = FlushGateStream::new(b"554 sentinel-secret echoed\r\n");
+    let mut connection = SmtpConnection::new(stream, Duration::from_secs(1));
+
+    let error = connection
+      .write_message_data(b"Subject: test\r\n\r\nbody\r\n")
+      .await
+      .unwrap_err();
+    let rendered = format!("{error:#}");
+
+    assert!(rendered.contains("remote SMTP message data"));
+    assert!(!rendered.contains("sentinel-secret"));
+    assert!(!rendered.contains("echoed"));
   }
 
   struct FlushGateStream {

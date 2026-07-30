@@ -72,20 +72,46 @@ Start the service:
 
 YAML and JSON are both supported. Example files:
 
-- [`examples/config.yaml`](/workspaces/mail/sendmail-sec/examples/config.yaml)
-- [`examples/config.json`](/workspaces/mail/sendmail-sec/examples/config.json)
+- [`examples/config.yaml`](examples/config.yaml)
+- [`examples/config.json`](examples/config.json)
+- [`examples/config-secrets.yaml`](examples/config-secrets.yaml)
+- [`examples/config-secrets.json`](examples/config-secrets.json)
 
 Important fields:
 
 - `listen.bind`: local SMTP bind address, default `0.0.0.0:2525`
 - `listen.allowed_networks`: CIDRs allowed to connect
 - `listen.auth`: inbound SMTP `AUTH PLAIN` credentials
+- `listen.auth.password_file`: file alternative to `listen.auth.password`
 - `remote_smtp.tls_mode`: `starttls` or `wrapper`
 - `remote_smtp.auth.mechanism`: `plain`, `oauthbearer`, or `xoauth2`
+- `remote_smtp.auth.password_file`: file alternative to `password` for `plain`
+- `remote_smtp.auth.access_token_file`: file alternative to `access_token` for OAuth
 - `tls.extra_root_certificates`: extra PEM roots for all outbound TLS connections
 - `openpgp.local_key_files`: mounted public key files or keyrings
 - `openpgp.local_key_directories`: directories scanned for public key files
 - `openpgp.encryption_mode`: `pgp_mime_body` or `full_message`
+
+### File-backed credentials
+
+Credential values can remain inline for backward compatibility, or be read
+from files mounted by Docker Compose or another secret manager. Configure
+exactly one member of each applicable pair:
+
+- `listen.auth.password` or `listen.auth.password_file`
+- `remote_smtp.auth.password` or `remote_smtp.auth.password_file` for `plain`
+- `remote_smtp.auth.access_token` or
+  `remote_smtp.auth.access_token_file` for `oauthbearer` and `xoauth2`
+
+Relative secret paths are resolved against the directory containing the
+configuration file. Secret files must be regular UTF-8 files no larger than
+64 KiB. One final LF or CRLF is removed so files produced by common
+line-oriented tools work as expected; all other content and whitespace is
+preserved. Missing, unreadable, invalid, oversized, or empty secret files stop
+configuration loading without logging the secret value.
+
+Secrets are loaded once during startup, including `--check-config`. Restart the
+process or recreate the container after rotating a secret.
 
 ## Container
 
@@ -131,6 +157,38 @@ docker run --rm \
   --config /config/sendmail-sec.yaml
 ```
 
+Use the checked-in Docker Compose example with host secret files that are kept
+outside the repository:
+
+```bash
+install -d -m 0700 "$HOME/.local/share/sendmail-sec/secrets"
+install -m 0444 /path/to/listen-password \
+  "$HOME/.local/share/sendmail-sec/secrets/listen-password"
+install -m 0444 /path/to/remote-password \
+  "$HOME/.local/share/sendmail-sec/secrets/remote-password"
+export SENDMAIL_SEC_LISTEN_PASSWORD_FILE="$HOME/.local/share/sendmail-sec/secrets/listen-password"
+export SENDMAIL_SEC_REMOTE_PASSWORD_FILE="$HOME/.local/share/sendmail-sec/secrets/remote-password"
+docker compose -f examples/compose.yaml up -d
+```
+
+The example grants only the required runtime secrets to the service. Compose
+mounts them as read-only files named `/run/secrets/listen_auth_password` and
+`/run/secrets/remote_smtp_password`. To use OAuth instead, select
+`oauthbearer` or `xoauth2`, configure `access_token_file`, and grant a
+corresponding token secret.
+
+For Compose secrets sourced with `file:`, Docker Compose uses bind mounts and
+does not apply the service secret's `uid`, `gid`, or `mode` settings. Protect
+the source directory on the rootless Docker daemon host with mode `0700`, and
+make each secret file readable by the image's non-root `app:app` user (mode
+`0444` in the example). The exported paths must be visible to that daemon.
+When Docker is accessed from a Dev Container or another Docker-outside-of-
+Docker setup, both the Compose configuration and secret source paths are
+daemon-side bind mounts; run Compose on the daemon host or use paths that exist
+identically from the daemon's point of view. See Docker's
+[Compose secrets guide](https://docs.docker.com/compose/how-tos/use-secrets/)
+and [service secrets reference](https://docs.docker.com/reference/compose-file/services/#secrets).
+
 Run the Docker integration test:
 
 ```bash
@@ -150,6 +208,7 @@ The integration test builds a temporary image, generates temporary OpenPGP and T
 - The process does not require write access beyond optional `/tmp`.
 - Logs are written to stdout/stderr.
 - Local key files are loaded at startup. Restart the container after changing mounted key material.
+- Credential files are loaded at startup. Restart the container after rotating a mounted secret.
 - The Docker image contains a static musl binary for `amd64`, `arm64`, and `riscv64`.
 - The Rust crate entry point now lives under `sources/` rather than `src/`.
 

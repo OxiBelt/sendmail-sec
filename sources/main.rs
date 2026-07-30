@@ -5,6 +5,7 @@ mod listener;
 mod message;
 mod openpgp;
 mod remote_smtp;
+mod secret;
 mod tls;
 
 use anyhow::Context;

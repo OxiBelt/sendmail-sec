@@ -140,6 +140,7 @@ client_container="sendmail-sec-client-${run_id}"
 tmpdir="$(mktemp -d)"
 gnupghome="${tmpdir}/gnupg"
 config_dir="${tmpdir}/config"
+secrets_dir="${tmpdir}/secrets"
 
 containers+=("$client_container" "$app_container" "$smtp_container")
 if [ "$APP_IMAGE_CLEANUP" = "1" ]; then
@@ -148,7 +149,15 @@ fi
 
 mkdir -p "$config_dir"
 chmod 755 "$config_dir"
+mkdir -p "$secrets_dir"
+chmod 755 "$secrets_dir"
 mkdir -m 700 "$gnupghome"
+
+printf '%s\n' "$INBOUND_PASSWORD" >"${secrets_dir}/listen_auth_password"
+printf '%s\r\n' "$REMOTE_PASSWORD" >"${secrets_dir}/remote_smtp_password"
+chmod 444 \
+  "${secrets_dir}/listen_auth_password" \
+  "${secrets_dir}/remote_smtp_password"
 
 log "generating ephemeral OpenPGP keypair"
 cat >"${tmpdir}/gpg-key.batch" <<GPG
@@ -216,7 +225,7 @@ listen:
   banner: sendmail-sec-integration
   auth:
     username: ${INBOUND_USERNAME}
-    password: ${INBOUND_PASSWORD}
+    password_file: /run/secrets/listen_auth_password
   allowed_networks:
     - 0.0.0.0/0
   message_size_limit_bytes: 1048576
@@ -229,7 +238,7 @@ remote_smtp:
   auth:
     mechanism: plain
     username: ${REMOTE_USERNAME}
-    password: ${REMOTE_PASSWORD}
+    password_file: /run/secrets/remote_smtp_password
   connect_timeout_secs: 10
   command_timeout_secs: 10
 
@@ -251,6 +260,10 @@ logging:
   filter: info
 YAML
 chmod 644 "${config_dir}/sendmail-sec.yaml"
+
+if grep -Eq '^[[:space:]]+(password|access_token):' "${config_dir}/sendmail-sec.yaml"; then
+  die "generated application config contains an inline secret field"
+fi
 
 cat >"${tmpdir}/smtp_server.py" <<'PY'
 import base64
@@ -483,6 +496,7 @@ docker create \
   "$app_image" \
   --config /config/sendmail-sec.yaml >/dev/null
 docker cp "$config_dir" "${app_container}:/config"
+docker cp "$secrets_dir" "${app_container}:/run"
 docker start "$app_container" >/dev/null
 wait_for_log "$app_container" "SMTP listener ready" 30
 

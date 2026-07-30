@@ -6,19 +6,42 @@ use std::{
 
 use anyhow::{Context, bail};
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
-#[derive(Debug, Clone, Deserialize)]
+use crate::secret::SecretString;
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
-  #[serde(default)]
   pub listen: ListenConfig,
   pub remote_smtp: RemoteSmtpConfig,
-  #[serde(default)]
   pub tls: TlsConfig,
-  #[serde(default)]
   pub openpgp: OpenPgpConfig,
-  #[serde(default)]
   pub logging: LoggingConfig,
+}
+
+#[derive(Deserialize)]
+struct ParsedAppConfig {
+  #[serde(default)]
+  listen: ListenConfig,
+  remote_smtp: RemoteSmtpConfig,
+  #[serde(default)]
+  tls: TlsConfig,
+  #[serde(default)]
+  openpgp: OpenPgpConfig,
+  #[serde(default)]
+  logging: LoggingConfig,
+}
+
+impl From<ParsedAppConfig> for AppConfig {
+  fn from(parsed: ParsedAppConfig) -> Self {
+    Self {
+      listen: parsed.listen,
+      remote_smtp: parsed.remote_smtp,
+      tls: parsed.tls,
+      openpgp: parsed.openpgp,
+      logging: parsed.logging,
+    }
+  }
 }
 
 impl AppConfig {
@@ -26,16 +49,16 @@ impl AppConfig {
     let raw: Vec<u8> =
       fs::read(path).with_context(|| format!("failed to read config file {}", path.display()))?;
 
-    let mut config: AppConfig = match path
+    let parsed: ParsedAppConfig = match path
       .extension()
       .and_then(|ext: &std::ffi::OsStr| ext.to_str())
     {
-      Some("json") => serde_json::from_slice::<Self>(&raw)
+      Some("json") => serde_json::from_slice(&raw)
         .with_context(|| format!("failed to parse JSON config {}", path.display()))?,
-      Some("yaml") | Some("yml") => serde_norway::from_slice::<Self>(&raw)
+      Some("yaml") | Some("yml") => serde_norway::from_slice(&raw)
         .with_context(|| format!("failed to parse YAML config {}", path.display()))?,
-      _ => serde_norway::from_slice::<Self>(&raw)
-        .or_else(|_| serde_json::from_slice::<Self>(&raw))
+      _ => serde_norway::from_slice(&raw)
+        .or_else(|_| serde_json::from_slice(&raw))
         .with_context(|| {
           format!(
             "failed to parse config {}; expected YAML or JSON",
@@ -44,7 +67,9 @@ impl AppConfig {
         })?,
     };
 
+    let mut config = Self::from(parsed);
     config.resolve_relative_paths(path);
+    config.resolve_secret_files()?;
     config.validate()?;
     Ok(config)
   }
@@ -71,6 +96,35 @@ impl AppConfig {
         *directory = base_dir.join(&directory);
       }
     }
+
+    self.listen.auth.password.resolve_relative_path(base_dir);
+    match &mut self.remote_smtp.auth {
+      RemoteAuthConfig::Plain { password, .. } => password.resolve_relative_path(base_dir),
+      RemoteAuthConfig::Oauthbearer { access_token, .. }
+      | RemoteAuthConfig::Xoauth2 { access_token, .. } => {
+        access_token.resolve_relative_path(base_dir);
+      }
+    }
+  }
+
+  fn resolve_secret_files(&mut self) -> anyhow::Result<()> {
+    self
+      .listen
+      .auth
+      .password
+      .resolve_file("listen.auth.password_file")?;
+
+    match &mut self.remote_smtp.auth {
+      RemoteAuthConfig::Plain { password, .. } => {
+        password.resolve_file("remote_smtp.auth.password_file")?;
+      }
+      RemoteAuthConfig::Oauthbearer { access_token, .. }
+      | RemoteAuthConfig::Xoauth2 { access_token, .. } => {
+        access_token.resolve_file("remote_smtp.auth.access_token_file")?;
+      }
+    }
+
+    Ok(())
   }
 
   fn validate(&self) -> anyhow::Result<()> {
@@ -78,7 +132,14 @@ impl AppConfig {
       bail!("listen.auth.username must not be empty");
     }
 
-    if self.listen.auth.password.is_empty() {
+    if self
+      .listen
+      .auth
+      .password
+      .expose()
+      .context("validating listen.auth.password")?
+      .is_empty()
+    {
       bail!("listen.auth.password must not be empty");
     }
 
@@ -112,7 +173,12 @@ impl AppConfig {
 
     match &self.remote_smtp.auth {
       RemoteAuthConfig::Plain { username, password } => {
-        if username.is_empty() || password.is_empty() {
+        if username.is_empty()
+          || password
+            .expose()
+            .context("validating remote_smtp.auth.password")?
+            .is_empty()
+        {
           bail!("remote_smtp.auth PLAIN requires non-empty username and password");
         }
       }
@@ -125,7 +191,12 @@ impl AppConfig {
         username,
         access_token,
       } => {
-        if username.is_empty() || access_token.is_empty() {
+        if username.is_empty()
+          || access_token
+            .expose()
+            .context("validating remote_smtp.auth.access_token")?
+            .is_empty()
+        {
           bail!("remote_smtp.auth OAuth mechanisms require non-empty username and access_token");
         }
       }
@@ -163,7 +234,7 @@ impl Default for ListenConfig {
       banner: default_listen_banner(),
       auth: InboundAuthConfig {
         username: String::new(),
-        password: String::new(),
+        password: SecretString::inline(String::new()),
       },
       allowed_networks: default_allowed_networks(),
       message_size_limit_bytes: default_message_size_limit(),
@@ -171,10 +242,40 @@ impl Default for ListenConfig {
   }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct InboundAuthConfig {
   pub username: String,
-  pub password: String,
+  pub password: SecretString,
+}
+
+#[derive(Deserialize)]
+struct RawInboundAuthConfig {
+  username: String,
+  #[serde(default)]
+  password: Option<String>,
+  #[serde(default)]
+  password_file: Option<PathBuf>,
+}
+
+impl<'de> Deserialize<'de> for InboundAuthConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let raw = RawInboundAuthConfig::deserialize(deserializer)?;
+    let password = SecretString::from_sources(
+      raw.password,
+      raw.password_file,
+      "listen.auth.password",
+      "listen.auth.password_file",
+    )
+    .map_err(de::Error::custom)?;
+
+    Ok(Self {
+      username: raw.username,
+      password,
+    })
+  }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,23 +302,106 @@ pub enum RemoteTlsMode {
   Wrapper,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "mechanism", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum RemoteAuthConfig {
+  Plain {
+    username: String,
+    password: SecretString,
+  },
+  Oauthbearer {
+    username: String,
+    access_token: SecretString,
+    authzid: Option<String>,
+  },
+  Xoauth2 {
+    username: String,
+    access_token: SecretString,
+  },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mechanism", rename_all = "snake_case")]
+enum RawRemoteAuthConfig {
   #[serde(alias = "PLAIN")]
-  Plain { username: String, password: String },
+  Plain {
+    username: String,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    password_file: Option<PathBuf>,
+  },
   #[serde(alias = "OAUTHBEARER")]
   Oauthbearer {
     username: String,
-    access_token: String,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    access_token_file: Option<PathBuf>,
     #[serde(default)]
     authzid: Option<String>,
   },
   #[serde(alias = "XOAUTH2")]
   Xoauth2 {
     username: String,
-    access_token: String,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    access_token_file: Option<PathBuf>,
   },
+}
+
+impl<'de> Deserialize<'de> for RemoteAuthConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    match RawRemoteAuthConfig::deserialize(deserializer)? {
+      RawRemoteAuthConfig::Plain {
+        username,
+        password,
+        password_file,
+      } => Ok(Self::Plain {
+        username,
+        password: SecretString::from_sources(
+          password,
+          password_file,
+          "remote_smtp.auth.password",
+          "remote_smtp.auth.password_file",
+        )
+        .map_err(de::Error::custom)?,
+      }),
+      RawRemoteAuthConfig::Oauthbearer {
+        username,
+        access_token,
+        access_token_file,
+        authzid,
+      } => Ok(Self::Oauthbearer {
+        username,
+        access_token: SecretString::from_sources(
+          access_token,
+          access_token_file,
+          "remote_smtp.auth.access_token",
+          "remote_smtp.auth.access_token_file",
+        )
+        .map_err(de::Error::custom)?,
+        authzid,
+      }),
+      RawRemoteAuthConfig::Xoauth2 {
+        username,
+        access_token,
+        access_token_file,
+      } => Ok(Self::Xoauth2 {
+        username,
+        access_token: SecretString::from_sources(
+          access_token,
+          access_token_file,
+          "remote_smtp.auth.access_token",
+          "remote_smtp.auth.access_token_file",
+        )
+        .map_err(de::Error::custom)?,
+      }),
+    }
+  }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -340,161 +524,5 @@ fn default_allowed_networks() -> Vec<IpNet> {
 }
 
 #[cfg(test)]
-mod tests {
-  use std::{
-    fs,
-    path::{Path, PathBuf},
-  };
-
-  use super::*;
-
-  const MINIMAL_YAML: &str = r#"
-listen:
-  auth:
-    username: inbound
-    password: secret
-remote_smtp:
-  host: smtp.example.com
-  auth:
-    mechanism: PLAIN
-    username: relay
-    password: secret
-"#;
-
-  const MINIMAL_JSON: &str = r#"{
-  "listen": {
-    "auth": {
-      "username": "inbound",
-      "password": "secret"
-    }
-  },
-  "remote_smtp": {
-    "host": "smtp.example.com",
-    "auth": {
-      "mechanism": "PLAIN",
-      "username": "relay",
-      "password": "secret"
-    }
-  }
-}"#;
-
-  struct TestConfigFile {
-    path: PathBuf,
-  }
-
-  impl TestConfigFile {
-    fn new(extension: Option<&str>, contents: &str) -> Self {
-      let mut path = std::env::temp_dir().join(format!("sendmail-sec-{}", uuid::Uuid::new_v4()));
-      if let Some(extension) = extension {
-        path.set_extension(extension);
-      }
-      fs::write(&path, contents).unwrap();
-      Self { path }
-    }
-
-    fn path(&self) -> &Path {
-      &self.path
-    }
-  }
-
-  impl Drop for TestConfigFile {
-    fn drop(&mut self) {
-      let _ = fs::remove_file(&self.path);
-    }
-  }
-
-  #[test]
-  fn loads_yaml_extensions_with_defaults_and_enum_aliases() {
-    for extension in ["yaml", "yml"] {
-      let file = TestConfigFile::new(Some(extension), MINIMAL_YAML);
-      let config = AppConfig::load(file.path()).unwrap();
-
-      assert_eq!(config.listen.bind, "0.0.0.0:2525".parse().unwrap());
-      assert_eq!(config.remote_smtp.port, 587);
-      assert!(matches!(
-        config.remote_smtp.auth,
-        RemoteAuthConfig::Plain { .. }
-      ));
-    }
-  }
-
-  #[test]
-  fn loads_yaml_anchor_aliases() {
-    let file = TestConfigFile::new(
-      Some("yaml"),
-      r#"
-relay_auth: &relay_auth
-  mechanism: plain
-  username: relay
-  password: secret
-listen:
-  auth:
-    username: inbound
-    password: secret
-remote_smtp:
-  host: smtp.example.com
-  auth: *relay_auth
-"#,
-    );
-
-    let config = AppConfig::load(file.path()).unwrap();
-    assert!(matches!(
-      config.remote_smtp.auth,
-      RemoteAuthConfig::Plain { .. }
-    ));
-  }
-
-  #[test]
-  fn extensionless_files_fall_back_between_yaml_and_json() {
-    for contents in [MINIMAL_YAML, MINIMAL_JSON] {
-      let file = TestConfigFile::new(None, contents);
-      let config = AppConfig::load(file.path()).unwrap();
-      assert_eq!(config.remote_smtp.host, "smtp.example.com");
-    }
-  }
-
-  #[test]
-  fn resolves_relative_paths_against_the_config_directory() {
-    let contents = format!(
-      "{MINIMAL_YAML}\ntls:\n  extra_root_certificates:\n    - roots/ca.pem\nopenpgp:\n  local_key_files:\n    - keys/public.asc\n  local_key_directories:\n    - keys\n"
-    );
-    let file = TestConfigFile::new(Some("yaml"), &contents);
-    let base = file.path().parent().unwrap();
-    let config = AppConfig::load(file.path()).unwrap();
-
-    assert_eq!(
-      config.tls.extra_root_certificates,
-      [base.join("roots/ca.pem")]
-    );
-    assert_eq!(
-      config.openpgp.local_key_files,
-      [base.join("keys/public.asc")]
-    );
-    assert_eq!(config.openpgp.local_key_directories, [base.join("keys")]);
-  }
-
-  #[test]
-  fn rejects_malformed_yaml() {
-    let file = TestConfigFile::new(Some("yaml"), "listen: [");
-    let error = AppConfig::load(file.path()).unwrap_err();
-    assert!(error.to_string().contains("failed to parse YAML config"));
-  }
-
-  #[test]
-  fn rejects_recursive_yaml_aliases() {
-    let file = TestConfigFile::new(
-      Some("yaml"),
-      r#"
-listen:
-  auth:
-    username: inbound
-    password: secret
-remote_smtp: &remote
-  host: smtp.example.com
-  auth: *remote
-"#,
-    );
-
-    assert!(AppConfig::load(file.path()).is_err());
-  }
-}
+#[path = "config_tests.rs"]
+mod tests;

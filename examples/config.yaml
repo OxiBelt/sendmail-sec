@@ -37,6 +37,10 @@ openpgp:
   key_cache_ttl_secs: 3600
   http_timeout_secs: 10
   encryption_mode: pgp_mime_body
+  unencrypted_recipients:
+    - address: archive@example.com
+      allow_split_delivery: false
 
 logging:
   filter: info
+  log_recipient_addresses: false

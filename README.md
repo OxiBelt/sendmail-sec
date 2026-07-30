@@ -1,6 +1,6 @@
 # sendmail-sec
 
-`sendmail-sec` is a Rust CLI that accepts authenticated SMTP submissions from localhost or private networks, encrypts the submitted mail with OpenPGP, and relays the encrypted message to a remote SMTP server over mandatory TLS using Rustls.
+`sendmail-sec` is a Rust CLI that accepts authenticated SMTP submissions from localhost or private networks, encrypts the submitted mail with OpenPGP by default, and relays it to a remote SMTP server over mandatory TLS using Rustls. Operators can explicitly allow selected envelope recipients to receive an unencrypted message.
 
 ## What It Does
 
@@ -13,6 +13,7 @@
   - WKD
   - `keys.openpgp.org`
 - Encrypts the message and wraps it as `multipart/encrypted` PGP/MIME.
+- Supports exact, explicitly configured envelope-recipient exceptions that bypass OpenPGP encryption.
 - Relays the encrypted message to a remote SMTP server using:
   - `PLAIN`
   - `OAUTHBEARER`
@@ -26,6 +27,7 @@
 - The default OpenPGP `encryption_mode` is `pgp_mime_body`, which preserves common outer mail headers such as `From`, `To`, `Cc`, `Date`, and `Subject`, and encrypts the MIME body.
 - If you want the entire raw message encrypted instead, set `openpgp.encryption_mode` to `full_message`.
 - Envelope recipients from SMTP are always used for remote relay delivery. Header recipients are also used for key lookup so that normal `To`/`Cc` delivery works, and Bcc-style envelope recipients can still be encrypted for.
+- Only SMTP envelope recipients can trigger an unencrypted-recipient exception. Sender-controlled `To`, `Cc`, and `Bcc` headers cannot downgrade encryption.
 
 ## Build
 
@@ -91,6 +93,55 @@ Important fields:
 - `openpgp.local_key_files`: mounted public key files or keyrings
 - `openpgp.local_key_directories`: directories scanned for public key files
 - `openpgp.encryption_mode`: `pgp_mime_body` or `full_message`
+- `openpgp.unencrypted_recipients`: exact envelope addresses allowed to bypass OpenPGP
+- `logging.log_recipient_addresses`: allow recipient details in debug-level logs
+
+### Unencrypted recipients
+
+OpenPGP encryption remains the default. To relay a message without OpenPGP for
+an exact SMTP envelope recipient, add an explicit exception:
+
+```yaml
+openpgp:
+  unencrypted_recipients:
+    - address: archive@example.com
+      allow_split_delivery: false
+```
+
+Addresses must be bare ASCII `local@domain` values. Matching is
+case-insensitive across the full address and does not apply wildcard, domain,
+or plus-address canonicalization. Invalid or duplicate normalized entries stop
+configuration loading. At least one OpenPGP key source is still required.
+
+If every envelope recipient matches the list, the listener-normalized original
+message is relayed without an OpenPGP wrapper. Inbound authentication, allowed
+networks, remote SMTP authentication, and mandatory TLS remain enforced. The
+message is plaintext at the message layer, however, and downstream delivery
+after the configured SMTP relay is outside `sendmail-sec`'s control. The raw
+message headers are not rewritten, including any submitted `Bcc` header.
+
+A message containing both encrypted and unencrypted recipients is rejected
+with SMTP status `554` unless every matching exception sets
+`allow_split_delivery: true`. An allowed split creates two outbound SMTP
+transactions: the encrypted group is delivered first, followed by the
+unencrypted group. Both deliveries are prepared before either is sent. The two
+remote transactions cannot be atomic; if the second fails after the first is
+accepted, the client receives `554`, and retrying can duplicate the accepted
+encrypted delivery.
+
+Unencrypted-delivery warnings and partial-delivery errors include counts but
+not recipient values. To make normalized recipient details available for
+troubleshooting, both enable debug logging and explicitly opt in:
+
+```yaml
+logging:
+  filter: debug
+  log_recipient_addresses: true
+```
+
+The recipient logging flag also governs OpenPGP lookup and remote `RCPT TO`
+details. Recipient addresses and address-bearing key lookup URLs are never
+included in higher-level logs.
 
 ### File-backed credentials
 
@@ -201,7 +252,7 @@ Wrapper TLS is the default. Exercise the explicit STARTTLS path with:
 REMOTE_TLS_MODE=starttls scripts/docker-integration-test.sh
 ```
 
-The integration test builds a temporary image, generates temporary OpenPGP and TLS material, copies test files into containers with `docker cp`, verifies encrypted SMTP relay through either wrapper TLS or STARTTLS, and removes the containers, network, image tag, and temporary files before exiting.
+The integration test builds a temporary image, generates temporary OpenPGP and TLS material, copies test files into containers with `docker cp`, verifies encrypted, unencrypted, rejected-mixed, split, and partial-delivery SMTP behavior through either wrapper TLS or STARTTLS, and removes the containers, network, image tag, and temporary files before exiting.
 
 ## Notes
 

@@ -1,4 +1,5 @@
 use std::{
+  collections::HashMap,
   fs,
   net::{IpAddr, SocketAddr},
   path::{Path, PathBuf},
@@ -70,6 +71,7 @@ impl AppConfig {
     let mut config = Self::from(parsed);
     config.resolve_relative_paths(path);
     config.resolve_secret_files()?;
+    config.normalize_unencrypted_recipients()?;
     config.validate()?;
     Ok(config)
   }
@@ -122,6 +124,23 @@ impl AppConfig {
       | RemoteAuthConfig::Xoauth2 { access_token, .. } => {
         access_token.resolve_file("remote_smtp.auth.access_token_file")?;
       }
+    }
+
+    Ok(())
+  }
+
+  fn normalize_unencrypted_recipients(&mut self) -> anyhow::Result<()> {
+    let mut seen = HashMap::new();
+
+    for (index, recipient) in self.openpgp.unencrypted_recipients.iter_mut().enumerate() {
+      let normalized = normalize_configured_email(&recipient.address)
+        .with_context(|| format!("openpgp.unencrypted_recipients[{index}].address is invalid"))?;
+
+      if let Some(previous_index) = seen.insert(normalized.clone(), index) {
+        bail!("openpgp.unencrypted_recipients[{index}].address duplicates entry {previous_index}");
+      }
+
+      recipient.address = normalized;
     }
 
     Ok(())
@@ -426,6 +445,8 @@ pub struct OpenPgpConfig {
   pub http_timeout_secs: u64,
   #[serde(default)]
   pub encryption_mode: EncryptionMode,
+  #[serde(default)]
+  pub unencrypted_recipients: Vec<UnencryptedRecipientConfig>,
 }
 
 impl Default for OpenPgpConfig {
@@ -438,8 +459,17 @@ impl Default for OpenPgpConfig {
       key_cache_ttl_secs: default_key_cache_ttl_secs(),
       http_timeout_secs: default_http_timeout_secs(),
       encryption_mode: EncryptionMode::default(),
+      unencrypted_recipients: Vec::new(),
     }
   }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UnencryptedRecipientConfig {
+  pub address: String,
+  #[serde(default)]
+  pub allow_split_delivery: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -454,14 +484,44 @@ pub enum EncryptionMode {
 pub struct LoggingConfig {
   #[serde(default = "default_log_filter")]
   pub filter: String,
+  #[serde(default)]
+  pub log_recipient_addresses: bool,
 }
 
 impl Default for LoggingConfig {
   fn default() -> Self {
     Self {
       filter: default_log_filter(),
+      log_recipient_addresses: false,
     }
   }
+}
+
+fn normalize_configured_email(value: &str) -> anyhow::Result<String> {
+  if value.is_empty()
+    || value.trim() != value
+    || !value.is_ascii()
+    || value
+      .bytes()
+      .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    || value.contains(['<', '>', ','])
+  {
+    bail!("expected a bare ASCII email address without whitespace");
+  }
+
+  let mut parts = value.split('@');
+  let local = parts.next().unwrap_or_default();
+  let domain = parts.next().unwrap_or_default();
+
+  if local.is_empty() || domain.is_empty() || parts.next().is_some() {
+    bail!("expected exactly one non-empty local and domain part");
+  }
+
+  Ok(format!(
+    "{}@{}",
+    local.to_ascii_lowercase(),
+    domain.to_ascii_lowercase()
+  ))
 }
 
 fn default_listen_bind() -> SocketAddr {

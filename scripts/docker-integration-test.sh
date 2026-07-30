@@ -7,6 +7,9 @@ APP_IMAGE_CLEANUP="${APP_IMAGE_CLEANUP:-0}"
 DOCKER_BUILD_PLATFORM="${DOCKER_BUILD_PLATFORM:-}"
 HELPER_IMAGE="${HELPER_IMAGE:-python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92}"
 PGP_EMAIL="${PGP_EMAIL:-recipient@example.test}"
+UNENCRYPTED_EMAIL="${UNENCRYPTED_EMAIL:-archive@example.test}"
+STRICT_UNENCRYPTED_EMAIL="${STRICT_UNENCRYPTED_EMAIL:-strict-archive@example.test}"
+FAILING_UNENCRYPTED_EMAIL="${FAILING_UNENCRYPTED_EMAIL:-failing-archive@example.test}"
 INBOUND_USERNAME="${INBOUND_USERNAME:-inbound-relay}"
 INBOUND_PASSWORD="${INBOUND_PASSWORD:-change-me}"
 REMOTE_USERNAME="${REMOTE_USERNAME:-relay-user}"
@@ -14,6 +17,7 @@ REMOTE_PASSWORD="${REMOTE_PASSWORD:-relay-password}"
 REMOTE_TLS_MODE="${REMOTE_TLS_MODE:-wrapper}"
 SMTP_HOST="smtp-fixture"
 SMTP_PORT="8465"
+EXPECTED_REMOTE_CONNECTIONS=6
 
 log() {
   printf '[integration] %s\n' "$*"
@@ -26,6 +30,45 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+verify_recipient_capture() {
+  local capture_number="$1"
+  local expected_recipient="$2"
+  local recipients_file="${tmpdir}/captures/delivery-${capture_number}.rcpt"
+
+  [ "$(wc -l <"$recipients_file")" -eq 1 ] \
+    || die "delivery ${capture_number} did not contain exactly one envelope recipient"
+  grep -Fxq "$expected_recipient" "$recipients_file" \
+    || die "delivery ${capture_number} used an unexpected envelope recipient"
+}
+
+verify_encrypted_capture() {
+  local capture_number="$1"
+  local expected_marker="$2"
+  local capture="${tmpdir}/captures/delivery-${capture_number}.eml"
+  local encrypted="${tmpdir}/encrypted-${capture_number}.asc"
+  local decrypted="${tmpdir}/decrypted-${capture_number}.txt"
+
+  grep -Fq "Content-Type: multipart/encrypted" "$capture"
+  grep -Fq -- "-----BEGIN PGP MESSAGE-----" "$capture"
+  sed -n '/-----BEGIN PGP MESSAGE-----/,/-----END PGP MESSAGE-----/p' \
+    "$capture" >"$encrypted"
+  gpg --batch --homedir "$gnupghome" --decrypt "$encrypted" \
+    >"$decrypted" 2>/dev/null
+  grep -Fq "$expected_marker" "$decrypted"
+}
+
+verify_unencrypted_capture() {
+  local capture_number="$1"
+  local expected_marker="$2"
+  local capture="${tmpdir}/captures/delivery-${capture_number}.eml"
+
+  grep -Fq "$expected_marker" "$capture"
+  if grep -Fq "Content-Type: multipart/encrypted" "$capture" \
+    || grep -Fq -- "-----BEGIN PGP MESSAGE-----" "$capture"; then
+    die "delivery ${capture_number} was unexpectedly OpenPGP encrypted"
+  fi
 }
 
 wait_for_log() {
@@ -255,9 +298,17 @@ openpgp:
   key_cache_ttl_secs: 30
   http_timeout_secs: 5
   encryption_mode: pgp_mime_body
+  unencrypted_recipients:
+    - address: ${UNENCRYPTED_EMAIL}
+      allow_split_delivery: true
+    - address: ${STRICT_UNENCRYPTED_EMAIL}
+      allow_split_delivery: false
+    - address: ${FAILING_UNENCRYPTED_EMAIL}
+      allow_split_delivery: true
 
 logging:
-  filter: info
+  filter: debug
+  log_recipient_addresses: true
 YAML
 chmod 644 "${config_dir}/sendmail-sec.yaml"
 
@@ -276,10 +327,12 @@ host = "0.0.0.0"
 port = int(os.environ["SMTP_PORT"])
 cert_path = "/tmp/server.crt"
 key_path = "/tmp/server.key"
-capture_path = "/tmp/captured.eml"
+capture_dir = "/tmp/captures"
 expected_user = os.environ["REMOTE_USERNAME"]
 expected_password = os.environ["REMOTE_PASSWORD"]
 tls_mode = os.environ["REMOTE_TLS_MODE"]
+expected_connections = int(os.environ["EXPECTED_CONNECTIONS"])
+reject_recipient = os.environ["REJECT_RECIPIENT"].lower()
 
 
 def send(file, line):
@@ -311,88 +364,110 @@ def read_data(file):
 
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+os.makedirs(capture_dir, exist_ok=True)
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
-    server.listen(1)
+    server.listen(expected_connections)
     print(f"SMTP fixture ready ({tls_mode})", flush=True)
 
-    conn, _ = server.accept()
-    file = None
-    try:
-        tls_active = tls_mode == "wrapper"
-        authenticated = False
-        if tls_active:
-            conn = context.wrap_socket(conn, server_side=True)
-        file = conn.makefile("rwb", buffering=0)
-        send(file, "220 smtp-fixture ESMTP ready")
-
-        while True:
-            line = read_line(file)
-            upper = line.upper()
-
-            if upper.startswith("EHLO ") or upper.startswith("HELO "):
-                send(file, "250-smtp-fixture")
-                if tls_active:
-                    send(file, "250-AUTH PLAIN")
-                else:
-                    send(file, "250-STARTTLS")
-                send(file, "250 SIZE 1048576")
-            elif upper == "STARTTLS":
-                if tls_active or tls_mode != "starttls":
-                    send(file, "454 TLS not available")
-                    continue
-                send(file, "220 ready to start TLS")
-                file.close()
+    for connection_number in range(1, expected_connections + 1):
+        conn, _ = server.accept()
+        file = None
+        recipients = []
+        capture_prefix = os.path.join(
+            capture_dir, f"delivery-{connection_number:02d}"
+        )
+        try:
+            tls_active = tls_mode == "wrapper"
+            authenticated = False
+            if tls_active:
                 conn = context.wrap_socket(conn, server_side=True)
-                file = conn.makefile("rwb", buffering=0)
-                tls_active = True
-            elif upper == "AUTH PLAIN":
-                if not tls_active:
-                    send(file, "530 must issue STARTTLS first")
-                    continue
-                send(file, "334 ")
-                payload = base64.b64decode(read_line(file)).decode("utf-8", errors="replace")
-                parts = payload.split("\x00")
-                username = parts[1] if len(parts) > 1 else ""
-                password = parts[2] if len(parts) > 2 else ""
-                if username != expected_user or password != expected_password:
-                    send(file, "535 authentication failed")
-                    sys.exit(2)
-                authenticated = True
-                send(file, "235 authentication successful")
-            elif upper.startswith("MAIL FROM:"):
-                if not tls_active or not authenticated:
-                    send(file, "530 authentication over TLS required")
-                    continue
-                send(file, "250 sender ok")
-            elif upper.startswith("RCPT TO:"):
-                if not tls_active or not authenticated:
-                    send(file, "530 authentication over TLS required")
-                    continue
-                send(file, "250 recipient ok")
-            elif upper == "DATA":
-                if not tls_active or not authenticated:
-                    send(file, "530 authentication over TLS required")
-                    continue
-                send(file, "354 end data with <CRLF>.<CRLF>")
-                data = read_data(file)
-                with open(capture_path, "wb") as output:
-                    output.write(data)
-                send(file, "250 message accepted")
-                # The assertion below only needs the accepted relay data. Do
-                # not make the fixture depend on client QUIT timing.
-                break
-            elif upper == "QUIT":
-                send(file, "221 bye")
-                break
-            else:
-                send(file, "502 command not implemented")
-    finally:
-        if file is not None:
-            file.close()
-        conn.close()
+            file = conn.makefile("rwb", buffering=0)
+            send(file, "220 smtp-fixture ESMTP ready")
+
+            while True:
+                line = read_line(file)
+                upper = line.upper()
+
+                if upper.startswith("EHLO ") or upper.startswith("HELO "):
+                    send(file, "250-smtp-fixture")
+                    if tls_active:
+                        send(file, "250-AUTH PLAIN")
+                    else:
+                        send(file, "250-STARTTLS")
+                    send(file, "250 SIZE 1048576")
+                elif upper == "STARTTLS":
+                    if tls_active or tls_mode != "starttls":
+                        send(file, "454 TLS not available")
+                        continue
+                    send(file, "220 ready to start TLS")
+                    file.close()
+                    conn = context.wrap_socket(conn, server_side=True)
+                    file = conn.makefile("rwb", buffering=0)
+                    tls_active = True
+                elif upper == "AUTH PLAIN":
+                    if not tls_active:
+                        send(file, "530 must issue STARTTLS first")
+                        continue
+                    send(file, "334 ")
+                    payload = base64.b64decode(read_line(file)).decode(
+                        "utf-8", errors="replace"
+                    )
+                    parts = payload.split("\x00")
+                    username = parts[1] if len(parts) > 1 else ""
+                    password = parts[2] if len(parts) > 2 else ""
+                    if username != expected_user or password != expected_password:
+                        send(file, "535 authentication failed")
+                        sys.exit(2)
+                    authenticated = True
+                    send(file, "235 authentication successful")
+                elif upper.startswith("MAIL FROM:"):
+                    if not tls_active or not authenticated:
+                        send(file, "530 authentication over TLS required")
+                        continue
+                    recipients.clear()
+                    send(file, "250 sender ok")
+                elif upper.startswith("RCPT TO:"):
+                    if not tls_active or not authenticated:
+                        send(file, "530 authentication over TLS required")
+                        continue
+                    recipient = line.split(":", 1)[1].strip().strip("<>").lower()
+                    if recipient == reject_recipient:
+                        with open(capture_prefix + ".rejected", "w", encoding="utf-8") as output:
+                            output.write(recipient + "\n")
+                        send(file, "550 configured integration rejection")
+                        break
+                    recipients.append(recipient)
+                    send(file, "250 recipient ok")
+                elif upper == "DATA":
+                    if not tls_active or not authenticated:
+                        send(file, "530 authentication over TLS required")
+                        continue
+                    send(file, "354 end data with <CRLF>.<CRLF>")
+                    data = read_data(file)
+                    with open(capture_prefix + ".eml", "wb") as output:
+                        output.write(data)
+                    with open(capture_prefix + ".rcpt", "w", encoding="utf-8") as output:
+                        output.write("\n".join(recipients) + "\n")
+                    send(file, "250 message accepted")
+                    # The assertions below only need accepted relay data. Do
+                    # not make the fixture depend on client QUIT timing.
+                    break
+                elif upper == "QUIT":
+                    send(file, "221 bye")
+                    break
+                else:
+                    send(file, "502 command not implemented")
+        finally:
+            if file is not None:
+                file.close()
+            conn.close()
+        print(
+            f"SMTP fixture completed connection {connection_number}/{expected_connections}",
+            flush=True,
+        )
 PY
 
 marker="sendmail-sec integration marker ${run_id}"
@@ -405,8 +480,11 @@ host = os.environ["SMTP_HOST"]
 port = int(os.environ["SMTP_PORT"])
 username = os.environ["INBOUND_USERNAME"]
 password = os.environ["INBOUND_PASSWORD"]
-recipient = os.environ["PGP_EMAIL"]
-marker = os.environ["MARKER"]
+pgp_recipient = os.environ["PGP_EMAIL"]
+unencrypted_recipient = os.environ["UNENCRYPTED_EMAIL"]
+strict_unencrypted_recipient = os.environ["STRICT_UNENCRYPTED_EMAIL"]
+failing_unencrypted_recipient = os.environ["FAILING_UNENCRYPTED_EMAIL"]
+marker_prefix = os.environ["MARKER"]
 
 
 def read_response(sock):
@@ -435,26 +513,39 @@ def command(sock, line, expected):
     expect(sock, expected)
 
 
-message = (
-    "From: Sender <sender@example.test>\r\n"
-    f"To: Recipient <{recipient}>\r\n"
-    "Subject: Docker integration test\r\n"
-    "Content-Type: text/plain; charset=utf-8\r\n"
-    "\r\n"
-    f"{marker}\r\n"
-)
+def submit(recipients, marker_suffix, expected_status):
+    marker = f"{marker_prefix}-{marker_suffix}"
+    to_header = ", ".join(recipients)
+    message = (
+        "From: Sender <sender@example.test>\r\n"
+        f"To: {to_header}\r\n"
+        f"Subject: Docker integration test {marker_suffix}\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "\r\n"
+        f"{marker}\r\n"
+    )
 
-with socket.create_connection((host, port), timeout=10) as sock:
-    expect(sock, "220")
-    command(sock, "EHLO integration-client", "250")
-    auth = base64.b64encode(f"\0{username}\0{password}".encode("utf-8")).decode("ascii")
-    command(sock, f"AUTH PLAIN {auth}", "235")
-    command(sock, "MAIL FROM:<sender@example.test>", "250")
-    command(sock, f"RCPT TO:<{recipient}>", "250")
-    command(sock, "DATA", "354")
-    sock.sendall(message.encode("utf-8") + b".\r\n")
-    expect(sock, "250")
-    command(sock, "QUIT", "221")
+    with socket.create_connection((host, port), timeout=10) as sock:
+        expect(sock, "220")
+        command(sock, "EHLO integration-client", "250")
+        auth = base64.b64encode(
+            f"\0{username}\0{password}".encode("utf-8")
+        ).decode("ascii")
+        command(sock, f"AUTH PLAIN {auth}", "235")
+        command(sock, "MAIL FROM:<sender@example.test>", "250")
+        for recipient in recipients:
+            command(sock, f"RCPT TO:<{recipient}>", "250")
+        command(sock, "DATA", "354")
+        sock.sendall(message.encode("utf-8") + b".\r\n")
+        expect(sock, expected_status)
+        command(sock, "QUIT", "221")
+
+
+submit([pgp_recipient], "encrypted", "250")
+submit([unencrypted_recipient], "unencrypted", "250")
+submit([pgp_recipient, strict_unencrypted_recipient], "strict-mixed", "554")
+submit([pgp_recipient, unencrypted_recipient], "split", "250")
+submit([pgp_recipient, failing_unencrypted_recipient], "partial", "554")
 PY
 
 if [ -n "$APP_IMAGE" ]; then
@@ -480,6 +571,8 @@ docker create \
   --env "REMOTE_USERNAME=${REMOTE_USERNAME}" \
   --env "REMOTE_PASSWORD=${REMOTE_PASSWORD}" \
   --env "REMOTE_TLS_MODE=${REMOTE_TLS_MODE}" \
+  --env "EXPECTED_CONNECTIONS=${EXPECTED_REMOTE_CONNECTIONS}" \
+  --env "REJECT_RECIPIENT=${FAILING_UNENCRYPTED_EMAIL}" \
   "$HELPER_IMAGE" \
   python /tmp/smtp_server.py >/dev/null
 docker cp "${tmpdir}/smtp_server.py" "${smtp_container}:/tmp/smtp_server.py"
@@ -509,6 +602,9 @@ docker create \
   --env "INBOUND_USERNAME=${INBOUND_USERNAME}" \
   --env "INBOUND_PASSWORD=${INBOUND_PASSWORD}" \
   --env "PGP_EMAIL=${PGP_EMAIL}" \
+  --env "UNENCRYPTED_EMAIL=${UNENCRYPTED_EMAIL}" \
+  --env "STRICT_UNENCRYPTED_EMAIL=${STRICT_UNENCRYPTED_EMAIL}" \
+  --env "FAILING_UNENCRYPTED_EMAIL=${FAILING_UNENCRYPTED_EMAIL}" \
   --env "MARKER=${marker}" \
   "$HELPER_IMAGE" \
   python /tmp/send_message.py >/dev/null
@@ -516,15 +612,47 @@ docker cp "${tmpdir}/send_message.py" "${client_container}:/tmp/send_message.py"
 docker start -a "$client_container"
 
 wait_for_container_exit "$smtp_container" 30
-docker cp "${smtp_container}:/tmp/captured.eml" "${tmpdir}/captured.eml"
+docker cp "${smtp_container}:/tmp/captures" "${tmpdir}/captures"
+docker logs "$app_container" >"${tmpdir}/app.log" 2>&1
 
-log "verifying captured relay message"
-grep -Fq "Content-Type: multipart/encrypted" "${tmpdir}/captured.eml"
-grep -Fq -- "-----BEGIN PGP MESSAGE-----" "${tmpdir}/captured.eml"
-sed -n '/-----BEGIN PGP MESSAGE-----/,/-----END PGP MESSAGE-----/p' \
-  "${tmpdir}/captured.eml" >"${tmpdir}/encrypted.asc"
-gpg --batch --homedir "$gnupghome" --decrypt "${tmpdir}/encrypted.asc" \
-  >"${tmpdir}/decrypted.txt" 2>/dev/null
-grep -Fq "$marker" "${tmpdir}/decrypted.txt"
+log "verifying encrypted-only delivery"
+verify_recipient_capture "01" "$PGP_EMAIL"
+verify_encrypted_capture "01" "${marker}-encrypted"
+
+log "verifying unencrypted-only delivery"
+verify_recipient_capture "02" "$UNENCRYPTED_EMAIL"
+verify_unencrypted_capture "02" "${marker}-unencrypted"
+
+log "verifying split delivery"
+verify_recipient_capture "03" "$PGP_EMAIL"
+verify_encrypted_capture "03" "${marker}-split"
+verify_recipient_capture "04" "$UNENCRYPTED_EMAIL"
+verify_unencrypted_capture "04" "${marker}-split"
+
+log "verifying partial split failure"
+verify_recipient_capture "05" "$PGP_EMAIL"
+verify_encrypted_capture "05" "${marker}-partial"
+grep -Fxq "$FAILING_UNENCRYPTED_EMAIL" \
+  "${tmpdir}/captures/delivery-06.rejected"
+[ ! -e "${tmpdir}/captures/delivery-06.eml" ] \
+  || die "rejected unencrypted delivery unexpectedly transferred message data"
+grep -Fq "client retry may duplicate a completed delivery" "${tmpdir}/app.log"
+
+log "verifying recipient address log gating"
+for recipient in \
+  "$PGP_EMAIL" \
+  "$UNENCRYPTED_EMAIL" \
+  "$STRICT_UNENCRYPTED_EMAIL" \
+  "$FAILING_UNENCRYPTED_EMAIL"; do
+  grep -F "$recipient" "${tmpdir}/app.log" | grep -Fq "DEBUG" \
+    || die "recipient details were not available in opted-in debug logs"
+  if grep -F "$recipient" "${tmpdir}/app.log" | grep -Fqv "DEBUG"; then
+    die "recipient details appeared above debug level"
+  fi
+done
+
+if grep -Fq "$marker" "${tmpdir}/app.log"; then
+  die "message content appeared in application logs"
+fi
 
 log "docker integration test passed"

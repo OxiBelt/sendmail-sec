@@ -12,11 +12,16 @@ pub struct App {
 impl App {
   pub async fn from_config(config: AppConfig) -> anyhow::Result<Self> {
     let tls: Arc<OutboundTls> = Arc::new(OutboundTls::from_config(&config.tls)?);
+    let log_recipient_addresses = config.logging.log_recipient_addresses;
     let openpgp: Arc<OpenPgpService> = Arc::new(OpenPgpService::new(&config, tls.clone()).await?);
-    let remote: Arc<RemoteSmtpClient> =
-      Arc::new(RemoteSmtpClient::new(config.remote_smtp.clone(), tls));
+    let remote: Arc<RemoteSmtpClient> = Arc::new(RemoteSmtpClient::new(
+      config.remote_smtp.clone(),
+      tls,
+      log_recipient_addresses,
+    ));
 
-    let listener: SmtpListener = SmtpListener::new(config.listen, openpgp, remote);
+    let listener: SmtpListener =
+      SmtpListener::new(config.listen, openpgp, remote, log_recipient_addresses);
     Ok(Self { listener })
   }
 

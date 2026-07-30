@@ -8,21 +8,31 @@ use tokio::{
   net::TcpStream,
   time::timeout,
 };
+use tracing::debug;
 
 use crate::{
   config::{RemoteAuthConfig, RemoteSmtpConfig, RemoteTlsMode},
-  message::{RelayMessage, dot_stuff},
+  message::{RelayMessage, dot_stuff, normalize_email},
   tls::OutboundTls,
 };
 
 pub struct RemoteSmtpClient {
   config: RemoteSmtpConfig,
   tls: Arc<OutboundTls>,
+  log_recipient_addresses: bool,
 }
 
 impl RemoteSmtpClient {
-  pub fn new(config: RemoteSmtpConfig, tls: Arc<OutboundTls>) -> Self {
-    Self { config, tls }
+  pub fn new(
+    config: RemoteSmtpConfig,
+    tls: Arc<OutboundTls>,
+    log_recipient_addresses: bool,
+  ) -> Self {
+    Self {
+      config,
+      tls,
+      log_recipient_addresses,
+    }
   }
 
   pub async fn send_message(&self, message: &RelayMessage) -> anyhow::Result<()> {
@@ -214,14 +224,25 @@ impl RemoteSmtpClient {
       .context("remote SMTP MAIL FROM rejected")?;
 
     for recipient in &message.envelope.rcpt_to {
-      connection
+      let result = connection
         .command_sensitive_expect(
           &format!("RCPT TO:<{recipient}>"),
           "remote SMTP RCPT TO",
           &[250, 251],
         )
-        .await
-        .with_context(|| format!("remote SMTP RCPT TO rejected for {recipient}"))?;
+        .await;
+
+      if let Err(error) = result {
+        if self.log_recipient_addresses {
+          let recipient = normalize_email(recipient);
+          debug!(
+            recipient,
+            error = %error,
+            "remote SMTP RCPT TO rejection details"
+          );
+        }
+        return Err(error).context("remote SMTP RCPT TO rejected");
+      }
     }
 
     connection
@@ -511,6 +532,8 @@ mod tests {
 
   use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+  use crate::{config::TlsConfig, secret::SecretString};
+
   use super::*;
 
   #[tokio::test]
@@ -610,6 +633,45 @@ mod tests {
     assert!(rendered.contains("remote SMTP message data"));
     assert!(!rendered.contains("sentinel-secret"));
     assert!(!rendered.contains("echoed"));
+  }
+
+  #[tokio::test]
+  async fn recipient_rejection_errors_hide_recipient_addresses() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = RemoteSmtpConfig {
+      host: "smtp.example.com".to_string(),
+      port: 587,
+      tls_mode: RemoteTlsMode::Starttls,
+      hello_name: "relay.example.com".to_string(),
+      auth: RemoteAuthConfig::Plain {
+        username: "relay".to_string(),
+        password: SecretString::inline("secret".to_string()),
+      },
+      connect_timeout_secs: 1,
+      command_timeout_secs: 1,
+    };
+    let tls = Arc::new(OutboundTls::from_config(&TlsConfig::default()).unwrap());
+    let client = RemoteSmtpClient::new(config, tls, false);
+    let stream = FlushGateStream::new(b"250 sender ok\r\n550 recipient rejected\r\n");
+    let mut connection = SmtpConnection::new(stream, Duration::from_secs(1));
+    let recipient = "sentinel-recipient@example.com";
+    let message = RelayMessage {
+      envelope: crate::message::Envelope {
+        mail_from: "sender@example.com".to_string(),
+        rcpt_to: vec![recipient.to_string()],
+      },
+      data: b"Subject: test\r\n\r\nbody\r\n".to_vec(),
+    };
+
+    let error = client
+      .send_transaction(&mut connection, &message)
+      .await
+      .unwrap_err();
+    let rendered = format!("{error:#}");
+
+    assert!(rendered.contains("remote SMTP RCPT TO rejected"));
+    assert!(!rendered.contains(recipient));
+    assert!(!rendered.contains("recipient rejected"));
   }
 
   struct FlushGateStream {

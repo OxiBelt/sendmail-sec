@@ -1,8 +1,10 @@
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Context, bail};
 use mailparse::{MailAddr, addrparse_header, parse_headers};
 use uuid::Uuid;
 
-use crate::config::EncryptionMode;
+use crate::config::{EncryptionMode, UnencryptedRecipientConfig};
 
 const OUTER_HEADER_ALLOWLIST: &[&str] = &[
   "date",
@@ -21,7 +23,7 @@ const OUTER_HEADER_ALLOWLIST: &[&str] = &[
   "resent-cc",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
   pub mail_from: String,
   pub rcpt_to: Vec<String>,
@@ -33,13 +35,105 @@ pub struct RelayMessage {
   pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryKind {
+  Encrypted,
+  Unencrypted,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedDelivery {
+  pub kind: DeliveryKind,
+  pub message: RelayMessage,
+  pub normalized_recipients: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientGroup {
+  pub envelope: Envelope,
+  pub normalized_recipients: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipientDeliveryPlan {
+  Encrypted(RecipientGroup),
+  Unencrypted(RecipientGroup),
+  Split {
+    encrypted: RecipientGroup,
+    unencrypted: RecipientGroup,
+  },
+}
+
+pub fn plan_recipient_deliveries(
+  envelope: &Envelope,
+  rules: &[UnencryptedRecipientConfig],
+) -> anyhow::Result<RecipientDeliveryPlan> {
+  let policy = rules
+    .iter()
+    .map(|rule| (rule.address.as_str(), rule.allow_split_delivery))
+    .collect::<HashMap<_, _>>();
+  let mut encrypted_recipients = Vec::new();
+  let mut encrypted_normalized = Vec::new();
+  let mut unencrypted_recipients = Vec::new();
+  let mut unencrypted_normalized = Vec::new();
+  let mut every_unencrypted_recipient_allows_split = true;
+
+  for recipient in &envelope.rcpt_to {
+    let normalized = normalize_email(recipient);
+    if let Some(allow_split_delivery) = policy.get(normalized.as_str()) {
+      unencrypted_recipients.push(recipient.clone());
+      push_unique(&mut unencrypted_normalized, normalized);
+      every_unencrypted_recipient_allows_split &= *allow_split_delivery;
+    } else {
+      encrypted_recipients.push(recipient.clone());
+      push_unique(&mut encrypted_normalized, normalized);
+    }
+  }
+
+  let encrypted = RecipientGroup {
+    envelope: Envelope {
+      mail_from: envelope.mail_from.clone(),
+      rcpt_to: encrypted_recipients,
+    },
+    normalized_recipients: encrypted_normalized,
+  };
+  let unencrypted = RecipientGroup {
+    envelope: Envelope {
+      mail_from: envelope.mail_from.clone(),
+      rcpt_to: unencrypted_recipients,
+    },
+    normalized_recipients: unencrypted_normalized,
+  };
+
+  if unencrypted.envelope.rcpt_to.is_empty() {
+    return Ok(RecipientDeliveryPlan::Encrypted(encrypted));
+  }
+  if encrypted.envelope.rcpt_to.is_empty() {
+    return Ok(RecipientDeliveryPlan::Unencrypted(unencrypted));
+  }
+  if !every_unencrypted_recipient_allows_split {
+    bail!("mixed encrypted and unencrypted recipients require explicit split-delivery permission");
+  }
+
+  Ok(RecipientDeliveryPlan::Split {
+    encrypted,
+    unencrypted,
+  })
+}
+
 pub fn collect_encryption_recipients(
   raw_message: &[u8],
   envelope: &Envelope,
+  excluded_recipients: &HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
   let mut recipients = extract_recipients_from_headers(raw_message)?;
+  recipients.retain(|recipient| !excluded_recipients.contains(recipient));
+
   for recipient in &envelope.rcpt_to {
-    push_unique(&mut recipients, normalize_email(recipient));
+    let normalized = normalize_email(recipient);
+    if !excluded_recipients.contains(&normalized) {
+      push_unique(&mut recipients, normalized);
+    }
   }
 
   if recipients.is_empty() {
@@ -299,6 +393,23 @@ pub fn dot_stuff(data: &[u8]) -> Vec<u8> {
 mod tests {
   use super::*;
 
+  fn rule(address: &str, allow_split_delivery: bool) -> UnencryptedRecipientConfig {
+    UnencryptedRecipientConfig {
+      address: address.to_string(),
+      allow_split_delivery,
+    }
+  }
+
+  fn envelope(recipients: &[&str]) -> Envelope {
+    Envelope {
+      mail_from: "sender@example.com".to_string(),
+      rcpt_to: recipients
+        .iter()
+        .map(|recipient| recipient.to_string())
+        .collect(),
+    }
+  }
+
   #[test]
   fn extracts_header_recipients() {
     let raw = b"From: sender@example.com\r\nTo: Alice <alice@example.com>\r\nCc: team@example.com\r\n\r\nhello\r\n";
@@ -317,8 +428,122 @@ mod tests {
   }
 
   #[test]
+  fn builds_full_message_plaintext_with_normalized_line_endings() {
+    let raw = b"From: sender@example.com\nSubject: hi\n\nhello\n";
+    let plaintext = plaintext_for_encryption(raw, EncryptionMode::FullMessage).unwrap();
+
+    assert_eq!(
+      plaintext,
+      b"From: sender@example.com\r\nSubject: hi\r\n\r\nhello\r\n"
+    );
+  }
+
+  #[test]
   fn dot_stuffs_lines_starting_with_period() {
     let stuffed = dot_stuff(b".hello\r\nworld\r\n");
     assert_eq!(stuffed, b"..hello\r\nworld\r\n");
+  }
+
+  #[test]
+  fn plans_encrypted_delivery_without_an_envelope_match() {
+    let plan = plan_recipient_deliveries(
+      &envelope(&["encrypted@example.com"]),
+      &[rule("header-only@example.com", false)],
+    )
+    .unwrap();
+
+    assert_eq!(
+      plan,
+      RecipientDeliveryPlan::Encrypted(RecipientGroup {
+        envelope: envelope(&["encrypted@example.com"]),
+        normalized_recipients: vec!["encrypted@example.com".to_string()],
+      })
+    );
+  }
+
+  #[test]
+  fn plans_unencrypted_delivery_with_case_insensitive_exact_matching() {
+    let plan = plan_recipient_deliveries(
+      &envelope(&["Archive@Example.COM"]),
+      &[rule("archive@example.com", false)],
+    )
+    .unwrap();
+
+    assert_eq!(
+      plan,
+      RecipientDeliveryPlan::Unencrypted(RecipientGroup {
+        envelope: envelope(&["Archive@Example.COM"]),
+        normalized_recipients: vec!["archive@example.com".to_string()],
+      })
+    );
+  }
+
+  #[test]
+  fn does_not_canonicalize_plus_addresses() {
+    let plan = plan_recipient_deliveries(
+      &envelope(&["archive+tag@example.com"]),
+      &[rule("archive@example.com", false)],
+    )
+    .unwrap();
+
+    assert!(matches!(plan, RecipientDeliveryPlan::Encrypted(_)));
+  }
+
+  #[test]
+  fn rejects_mixed_delivery_without_permission_from_every_match() {
+    let error = plan_recipient_deliveries(
+      &envelope(&[
+        "encrypted@example.com",
+        "split@example.com",
+        "strict@example.com",
+      ]),
+      &[
+        rule("split@example.com", true),
+        rule("strict@example.com", false),
+      ],
+    )
+    .unwrap_err();
+
+    assert!(
+      error
+        .to_string()
+        .contains("require explicit split-delivery permission")
+    );
+  }
+
+  #[test]
+  fn plans_encrypted_first_split_when_every_match_allows_it() {
+    let plan = plan_recipient_deliveries(
+      &envelope(&["encrypted@example.com", "passthrough@example.com"]),
+      &[rule("passthrough@example.com", true)],
+    )
+    .unwrap();
+
+    assert_eq!(
+      plan,
+      RecipientDeliveryPlan::Split {
+        encrypted: RecipientGroup {
+          envelope: envelope(&["encrypted@example.com"]),
+          normalized_recipients: vec!["encrypted@example.com".to_string()],
+        },
+        unencrypted: RecipientGroup {
+          envelope: envelope(&["passthrough@example.com"]),
+          normalized_recipients: vec!["passthrough@example.com".to_string()],
+        },
+      }
+    );
+  }
+
+  #[test]
+  fn excludes_only_matched_unencrypted_recipients_from_key_lookup() {
+    let raw = b"To: passthrough@example.com\r\nCc: header-only@example.com\r\n\r\nbody\r\n";
+    let excluded = HashSet::from(["passthrough@example.com".to_string()]);
+    let recipients =
+      collect_encryption_recipients(raw, &envelope(&["encrypted@example.com"]), &excluded).unwrap();
+
+    assert_eq!(
+      recipients,
+      vec!["header-only@example.com", "encrypted@example.com"]
+    );
   }
 }

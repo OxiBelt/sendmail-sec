@@ -6,10 +6,13 @@ use tokio::{
   io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
   net::{TcpListener, TcpStream},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
-  config::ListenConfig, message::Envelope, openpgp::OpenPgpService, remote_smtp::RemoteSmtpClient,
+  config::ListenConfig,
+  message::{DeliveryKind, Envelope, normalize_email},
+  openpgp::OpenPgpService,
+  remote_smtp::RemoteSmtpClient,
 };
 
 #[derive(Clone)]
@@ -17,6 +20,7 @@ pub struct SmtpListener {
   listen: ListenConfig,
   openpgp: Arc<OpenPgpService>,
   remote: Arc<RemoteSmtpClient>,
+  log_recipient_addresses: bool,
 }
 
 impl SmtpListener {
@@ -24,11 +28,13 @@ impl SmtpListener {
     listen: ListenConfig,
     openpgp: Arc<OpenPgpService>,
     remote: Arc<RemoteSmtpClient>,
+    log_recipient_addresses: bool,
   ) -> Self {
     Self {
       listen,
       openpgp,
       remote,
+      log_recipient_addresses,
     }
   }
 
@@ -205,29 +211,121 @@ impl SmtpListener {
             rcpt_to: state.rcpt_to.clone(),
           };
 
-          match self.openpgp.encrypt_message(&envelope, &raw_message).await {
-            Ok(relay_message) => match self.remote.send_message(&relay_message).await {
-              Ok(()) => {
-                state.reset_transaction();
-                self
-                  .write_response(&mut reader, 250, "message relayed")
-                  .await?;
-              }
-              Err(error) => {
-                error!(peer = %peer, error = %error, "failed to relay message");
-                state.reset_transaction();
-                self
-                  .write_response(&mut reader, 554, "failed to relay message")
-                  .await?;
-              }
-            },
+          let deliveries = match self
+            .openpgp
+            .prepare_deliveries(&envelope, &raw_message)
+            .await
+          {
+            Ok(deliveries) => deliveries,
             Err(error) => {
-              error!(peer = %peer, error = %error, "failed to encrypt message");
+              error!(peer = %peer, error = %error, "failed to prepare message");
+              if self.log_recipient_addresses {
+                let recipients = envelope
+                  .rcpt_to
+                  .iter()
+                  .map(|recipient| normalize_email(recipient))
+                  .collect::<Vec<_>>();
+                debug!(
+                  peer = %peer,
+                  ?recipients,
+                  error = %error,
+                  "message preparation failure recipient details"
+                );
+              }
               state.reset_transaction();
               self
-                .write_response(&mut reader, 554, "failed to encrypt message")
+                .write_response(&mut reader, 554, "failed to prepare message")
                 .await?;
+              continue;
             }
+          };
+
+          let unencrypted_recipient_count = deliveries
+            .iter()
+            .filter(|delivery| delivery.kind == DeliveryKind::Unencrypted)
+            .map(|delivery| delivery.message.envelope.rcpt_to.len())
+            .sum::<usize>();
+          let encrypted_recipient_count = deliveries
+            .iter()
+            .filter(|delivery| delivery.kind == DeliveryKind::Encrypted)
+            .map(|delivery| delivery.message.envelope.rcpt_to.len())
+            .sum::<usize>();
+
+          if unencrypted_recipient_count > 0 {
+            warn!(
+              peer = %peer,
+              unencrypted_recipient_count,
+              encrypted_recipient_count,
+              split_delivery = deliveries.len() > 1,
+              "message includes configured unencrypted delivery"
+            );
+          }
+
+          if self.log_recipient_addresses {
+            for delivery in &deliveries {
+              debug!(
+                peer = %peer,
+                delivery_kind = ?delivery.kind,
+                recipients = ?delivery.normalized_recipients,
+                "prepared delivery recipient details"
+              );
+            }
+          }
+
+          let delivery_count = deliveries.len();
+          let mut completed_deliveries = 0usize;
+          let mut relay_failure = None;
+
+          for delivery in &deliveries {
+            match self.remote.send_message(&delivery.message).await {
+              Ok(()) => completed_deliveries += 1,
+              Err(error) => {
+                relay_failure = Some((delivery.kind, &delivery.normalized_recipients, error));
+                break;
+              }
+            }
+          }
+
+          if let Some((delivery_kind, recipients, error)) = relay_failure {
+            if completed_deliveries > 0 {
+              error!(
+                peer = %peer,
+                error = %error,
+                ?delivery_kind,
+                completed_deliveries,
+                delivery_count,
+                "prepared delivery failed after partial acceptance; client retry may duplicate a completed delivery"
+              );
+            } else {
+              error!(
+                peer = %peer,
+                error = %error,
+                ?delivery_kind,
+                completed_deliveries,
+                delivery_count,
+                "failed to relay prepared delivery"
+              );
+            }
+            if self.log_recipient_addresses {
+              debug!(
+                peer = %peer,
+                ?delivery_kind,
+                ?recipients,
+                completed_deliveries,
+                delivery_count,
+                error = %error,
+                "relay failure recipient details"
+              );
+            }
+            state.reset_transaction();
+            self
+              .write_response(&mut reader, 554, "failed to relay all message deliveries")
+              .await?;
+          } else {
+            state.reset_transaction();
+            self
+              .write_response(&mut reader, 250, "message relayed")
+              .await?;
           }
         }
         "RSET" => {

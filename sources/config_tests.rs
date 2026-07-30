@@ -98,6 +98,8 @@ fn loads_yaml_extensions_with_defaults_and_enum_aliases() {
       config.remote_smtp.auth,
       RemoteAuthConfig::Plain { .. }
     ));
+    assert!(config.openpgp.unencrypted_recipients.is_empty());
+    assert!(!config.logging.log_recipient_addresses);
   }
 }
 
@@ -421,4 +423,142 @@ remote_smtp: &remote
   );
 
   assert!(AppConfig::load(file.path()).is_err());
+}
+
+#[test]
+fn loads_and_normalizes_unencrypted_recipient_settings() {
+  let cases = [
+    (
+      "yaml",
+      format!(
+        "{MINIMAL_YAML}\nopenpgp:\n  unencrypted_recipients:\n    - address: Archive@Example.COM\n      allow_split_delivery: true\nlogging:\n  log_recipient_addresses: true\n"
+      ),
+    ),
+    (
+      "json",
+      serde_json::json!({
+        "listen": {
+          "auth": {
+            "username": "inbound",
+            "password": "secret"
+          }
+        },
+        "remote_smtp": {
+          "host": "smtp.example.com",
+          "auth": {
+            "mechanism": "PLAIN",
+            "username": "relay",
+            "password": "secret"
+          }
+        },
+        "openpgp": {
+          "unencrypted_recipients": [
+            {
+              "address": "Archive@Example.COM",
+              "allow_split_delivery": true
+            }
+          ]
+        },
+        "logging": {
+          "log_recipient_addresses": true
+        }
+      })
+      .to_string(),
+    ),
+  ];
+
+  for (extension, contents) in cases {
+    let file = TestConfigFile::new(Some(extension), &contents);
+    let config = AppConfig::load(file.path()).unwrap();
+
+    assert_eq!(
+      config.openpgp.unencrypted_recipients,
+      [UnencryptedRecipientConfig {
+        address: "archive@example.com".to_string(),
+        allow_split_delivery: true,
+      }]
+    );
+    assert!(config.logging.log_recipient_addresses);
+  }
+}
+
+#[test]
+fn defaults_split_delivery_permission_to_false() {
+  let file = TestConfigFile::new(
+    Some("yaml"),
+    &format!(
+      "{MINIMAL_YAML}\nopenpgp:\n  unencrypted_recipients:\n    - address: archive@example.com\n"
+    ),
+  );
+  let config = AppConfig::load(file.path()).unwrap();
+
+  assert!(!config.openpgp.unencrypted_recipients[0].allow_split_delivery);
+}
+
+#[test]
+fn rejects_invalid_unencrypted_recipient_addresses_without_echoing_them() {
+  for invalid in [
+    "missing-at-sign",
+    "two@@example.com",
+    "Display Name <user@example.com>",
+    "user @example.com",
+    "üser@example.com",
+  ] {
+    let file = TestConfigFile::new(
+      Some("yaml"),
+      &format!(
+        "{MINIMAL_YAML}\nopenpgp:\n  unencrypted_recipients:\n    - address: \"{invalid}\"\n"
+      ),
+    );
+    let error = AppConfig::load(file.path()).unwrap_err();
+    let rendered = format!("{error:#}");
+
+    assert!(rendered.contains("openpgp.unencrypted_recipients[0].address is invalid"));
+    assert!(!rendered.contains(invalid));
+  }
+}
+
+#[test]
+fn rejects_duplicate_normalized_unencrypted_recipients_without_echoing_them() {
+  let file = TestConfigFile::new(
+    Some("yaml"),
+    &format!(
+      "{MINIMAL_YAML}\nopenpgp:\n  unencrypted_recipients:\n    - address: archive@example.com\n    - address: Archive@Example.COM\n      allow_split_delivery: true\n"
+    ),
+  );
+  let error = AppConfig::load(file.path()).unwrap_err();
+  let rendered = format!("{error:#}");
+
+  assert!(rendered.contains("duplicates entry 0"));
+  assert!(!rendered.contains("archive@example.com"));
+  assert!(!rendered.contains("Archive@Example.COM"));
+}
+
+#[test]
+fn rejects_unknown_unencrypted_recipient_fields() {
+  let file = TestConfigFile::new(
+    Some("yaml"),
+    &format!(
+      "{MINIMAL_YAML}\nopenpgp:\n  unencrypted_recipients:\n    - address: archive@example.com\n      allow_split_deliveries: true\n"
+    ),
+  );
+  let error = AppConfig::load(file.path()).unwrap_err();
+
+  assert!(
+    format!("{error:#}").contains("allow_split_deliveries"),
+    "unknown security-sensitive fields must not be ignored"
+  );
+}
+
+#[test]
+fn unencrypted_recipients_do_not_waive_key_source_requirement() {
+  let file = TestConfigFile::new(
+    Some("yaml"),
+    &format!(
+      "{MINIMAL_YAML}\nopenpgp:\n  enable_wkd: false\n  enable_keys_openpgp_org: false\n  unencrypted_recipients:\n    - address: archive@example.com\n"
+    ),
+  );
+  let error = AppConfig::load(file.path()).unwrap_err();
+
+  assert!(format!("{error:#}").contains("at least one OpenPGP key source must be enabled"));
 }

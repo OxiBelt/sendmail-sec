@@ -12,7 +12,7 @@ use reqwest::{Client, StatusCode};
 use sequoia_openpgp as openpgp;
 use sha1::{Digest, Sha1};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use openpgp::{
   Cert,
@@ -26,8 +26,9 @@ use openpgp::{
 use crate::{
   config::{AppConfig, OpenPgpConfig},
   message::{
-    Envelope, RelayMessage, build_encrypted_message, collect_encryption_recipients,
-    plaintext_for_encryption,
+    DeliveryKind, Envelope, PreparedDelivery, RecipientDeliveryPlan, RecipientGroup, RelayMessage,
+    build_encrypted_message, collect_encryption_recipients, plaintext_for_encryption,
+    plan_recipient_deliveries,
   },
   tls::OutboundTls,
 };
@@ -40,6 +41,7 @@ pub struct OpenPgpService {
   http_client: Client,
   local_index: HashMap<String, Vec<Cert>>,
   cache: RwLock<HashMap<String, CachedCerts>>,
+  log_recipient_addresses: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,15 +60,51 @@ impl OpenPgpService {
       http_client,
       local_index,
       cache: RwLock::new(HashMap::new()),
+      log_recipient_addresses: config.logging.log_recipient_addresses,
     })
   }
 
-  pub async fn encrypt_message(
+  pub async fn prepare_deliveries(
     &self,
     envelope: &Envelope,
     raw_message: &[u8],
-  ) -> anyhow::Result<RelayMessage> {
-    let recipients = collect_encryption_recipients(raw_message, envelope)?;
+  ) -> anyhow::Result<Vec<PreparedDelivery>> {
+    match plan_recipient_deliveries(envelope, &self.config.unencrypted_recipients)? {
+      RecipientDeliveryPlan::Encrypted(group) => {
+        let delivery = self
+          .prepare_encrypted_delivery(group, raw_message, &HashSet::new())
+          .await?;
+        Ok(vec![delivery])
+      }
+      RecipientDeliveryPlan::Unencrypted(group) => {
+        Ok(vec![prepare_unencrypted_delivery(group, raw_message)])
+      }
+      RecipientDeliveryPlan::Split {
+        encrypted,
+        unencrypted,
+      } => {
+        let excluded_recipients = unencrypted
+          .normalized_recipients
+          .iter()
+          .cloned()
+          .collect::<HashSet<_>>();
+        let encrypted = self
+          .prepare_encrypted_delivery(encrypted, raw_message, &excluded_recipients)
+          .await?;
+        let unencrypted = prepare_unencrypted_delivery(unencrypted, raw_message);
+        Ok(vec![encrypted, unencrypted])
+      }
+    }
+  }
+
+  async fn prepare_encrypted_delivery(
+    &self,
+    group: RecipientGroup,
+    raw_message: &[u8],
+    excluded_recipients: &HashSet<String>,
+  ) -> anyhow::Result<PreparedDelivery> {
+    let recipients =
+      collect_encryption_recipients(raw_message, &group.envelope, excluded_recipients)?;
     let plaintext = plaintext_for_encryption(raw_message, self.config.encryption_mode.clone())?;
 
     let mut certs = Vec::new();
@@ -82,14 +120,30 @@ impl OpenPgpService {
     let armored_ciphertext = encrypt_to_armored_message(&plaintext, &certs)?;
     let data = build_encrypted_message(raw_message, &armored_ciphertext)?;
 
-    Ok(RelayMessage {
-      envelope: envelope.clone(),
-      data,
+    Ok(PreparedDelivery {
+      kind: DeliveryKind::Encrypted,
+      normalized_recipients: group.normalized_recipients,
+      message: RelayMessage {
+        envelope: group.envelope,
+        data,
+      },
     })
   }
 
   async fn resolve_recipient_certs(&self, recipient: &str) -> anyhow::Result<Vec<Cert>> {
-    let recipient = normalize_lookup_email(recipient)?;
+    let recipient = match normalize_lookup_email(recipient) {
+      Ok(recipient) => recipient,
+      Err(error) => {
+        if self.log_recipient_addresses {
+          debug!(
+            recipient,
+            error = %error,
+            "invalid OpenPGP lookup recipient"
+          );
+        }
+        return Err(error);
+      }
+    };
 
     if let Some(certs) = self.cached_lookup(&recipient).await {
       return Ok(certs);
@@ -114,7 +168,10 @@ impl OpenPgpService {
       return Ok(certs);
     }
 
-    bail!("no OpenPGP public key found for recipient {recipient}");
+    if self.log_recipient_addresses {
+      debug!(recipient, "no OpenPGP public key found for recipient");
+    }
+    bail!("no OpenPGP public key found for a required recipient");
   }
 
   async fn cached_lookup(&self, recipient: &str) -> Option<Vec<Cert>> {
@@ -155,7 +212,15 @@ impl OpenPgpService {
         Ok(Some(certs)) => return Ok(Some(certs)),
         Ok(None) => continue,
         Err(error) => {
-          warn!(recipient, %url, error = %error, "WKD lookup failed");
+          warn!(error = %error, "WKD lookup failed");
+          if self.log_recipient_addresses {
+            debug!(
+              recipient,
+              %url,
+              error = %error,
+              "WKD lookup failure details"
+            );
+          }
         }
       }
     }
@@ -171,16 +236,25 @@ impl OpenPgpService {
       "https://keys.openpgp.org/vks/v1/by-email/{}",
       urlencoding::encode(recipient)
     );
-    self.fetch_certs(&url, recipient).await
+    let result = self.fetch_certs(&url, recipient).await;
+    if let Err(error) = &result
+      && self.log_recipient_addresses
+    {
+      debug!(
+        recipient,
+        %url,
+        error = %error,
+        "keys.openpgp.org lookup failure details"
+      );
+    }
+    result
   }
 
   async fn fetch_certs(&self, url: &str, recipient: &str) -> anyhow::Result<Option<Vec<Cert>>> {
-    let response = self
-      .http_client
-      .get(url)
-      .send()
-      .await
-      .with_context(|| format!("failed to GET {url}"))?;
+    let response =
+      self.http_client.get(url).send().await.map_err(|error| {
+        anyhow::anyhow!("failed to request OpenPGP key: {}", error.without_url())
+      })?;
 
     match response.status() {
       StatusCode::OK => {
@@ -188,17 +262,27 @@ impl OpenPgpService {
           .bytes()
           .await
           .context("failed to read key response body")?;
-        let certs = parse_certs(&body)
-          .with_context(|| format!("failed to parse OpenPGP certificate from {url}"))?;
+        let certs = parse_certs(&body).context("failed to parse OpenPGP certificate response")?;
         let certs = filter_certs_for_email(certs, recipient);
         if certs.is_empty() {
-          bail!("retrieved keys from {url}, but none matched recipient {recipient}");
+          bail!("retrieved OpenPGP keys did not match the required recipient");
         }
         Ok(Some(certs))
       }
       StatusCode::NOT_FOUND | StatusCode::NO_CONTENT | StatusCode::GONE => Ok(None),
-      status => bail!("unexpected HTTP status {status} from {url}"),
+      status => bail!("unexpected HTTP status {status} from OpenPGP key service"),
     }
+  }
+}
+
+fn prepare_unencrypted_delivery(group: RecipientGroup, raw_message: &[u8]) -> PreparedDelivery {
+  PreparedDelivery {
+    kind: DeliveryKind::Unencrypted,
+    normalized_recipients: group.normalized_recipients,
+    message: RelayMessage {
+      envelope: group.envelope,
+      data: raw_message.to_vec(),
+    },
   }
 }
 
@@ -343,11 +427,11 @@ fn encrypt_to_armored_message(plaintext: &[u8], certs: &[Cert]) -> anyhow::Resul
 
 fn split_email(email: &str) -> anyhow::Result<(&str, &str)> {
   let Some((local, domain)) = email.rsplit_once('@') else {
-    bail!("invalid email address {email}");
+    bail!("invalid recipient email address");
   };
 
   if local.is_empty() || domain.is_empty() {
-    bail!("invalid email address {email}");
+    bail!("invalid recipient email address");
   }
 
   Ok((local, domain))
@@ -411,5 +495,34 @@ mod tests {
   fn normalizes_lookup_email() {
     let email = normalize_lookup_email("Alice@Example.COM").unwrap();
     assert_eq!(email, "alice@example.com");
+  }
+
+  #[test]
+  fn invalid_lookup_errors_hide_recipient_values() {
+    let sentinel = "sentinel-recipient-without-at";
+    let error = normalize_lookup_email(sentinel).unwrap_err();
+    let rendered = format!("{error:#}");
+
+    assert!(rendered.contains("invalid recipient email address"));
+    assert!(!rendered.contains(sentinel));
+  }
+
+  #[test]
+  fn prepares_unencrypted_delivery_without_transforming_data() {
+    let raw = b"Subject: passthrough\n\nbody\n";
+    let delivery = prepare_unencrypted_delivery(
+      RecipientGroup {
+        envelope: Envelope {
+          mail_from: "sender@example.com".to_string(),
+          rcpt_to: vec!["archive@example.com".to_string()],
+        },
+        normalized_recipients: vec!["archive@example.com".to_string()],
+      },
+      raw,
+    );
+
+    assert_eq!(delivery.kind, DeliveryKind::Unencrypted);
+    assert_eq!(delivery.message.data, raw);
+    assert_eq!(delivery.message.envelope.rcpt_to, ["archive@example.com"]);
   }
 }
